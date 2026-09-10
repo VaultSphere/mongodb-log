@@ -1,0 +1,116 @@
+package com.vaultsphere.mongodblog.web;
+
+import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
+import com.vaultsphere.mongodblog.analysis.SlowQueryRecord;
+import com.vaultsphere.mongodblog.storage.TaskRepository;
+import com.vaultsphere.mongodblog.task.AnalysisTask;
+import com.vaultsphere.mongodblog.task.TaskService;
+import com.vaultsphere.mongodblog.task.TaskStatus;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.List;
+import java.util.Locale;
+import java.util.NoSuchElementException;
+
+@RestController
+@RequestMapping("/api/tasks")
+public class TaskController {
+    private final TaskService taskService;
+    private final TaskRepository repository;
+
+    public TaskController(TaskService taskService, TaskRepository repository) {
+        this.taskService = taskService;
+        this.repository = repository;
+    }
+
+    @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<AnalysisTask> create(
+            @RequestParam(required = false) String name,
+            @RequestParam("files") List<MultipartFile> files
+    ) {
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(taskService.create(name, files));
+    }
+
+    @GetMapping
+    public List<AnalysisTask> list() {
+        return taskService.list();
+    }
+
+    @GetMapping("/{taskId}")
+    public AnalysisTask get(@PathVariable String taskId) {
+        return taskService.get(taskId);
+    }
+
+    @GetMapping("/{taskId}/summary")
+    public AnalysisSummary summary(@PathVariable String taskId) {
+        requireCompleted(taskId);
+        return repository.readSummary(taskId);
+    }
+
+    @GetMapping("/{taskId}/slow-queries")
+    public SlowQueryPage slowQueries(
+            @PathVariable String taskId,
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) String namespace,
+            @RequestParam(required = false) String operation,
+            @RequestParam(defaultValue = "0") long minDurationMillis,
+            @RequestParam(required = false) String planSummary
+    ) {
+        validatePage(page, size, minDurationMillis);
+        requireCompleted(taskId);
+        List<SlowQueryRecord> filtered = repository.readSlowQueries(taskId).stream()
+                .filter(record -> contains(record.namespace(), namespace))
+                .filter(record -> contains(record.operation(), operation))
+                .filter(record -> record.durationMillis() >= minDurationMillis)
+                .filter(record -> contains(record.planSummary(), planSummary))
+                .toList();
+        int from = Math.min((page - 1) * size, filtered.size());
+        int to = Math.min(from + size, filtered.size());
+        return new SlowQueryPage(page, size, filtered.size(), filtered.subList(from, to));
+    }
+
+    @GetMapping("/{taskId}/slow-queries/{queryId}")
+    public SlowQueryRecord slowQuery(@PathVariable String taskId, @PathVariable String queryId) {
+        requireCompleted(taskId);
+        return repository.readSlowQuery(taskId, queryId)
+                .orElseThrow(() -> new NoSuchElementException("慢查询不存在：" + queryId));
+    }
+
+    private void requireCompleted(String taskId) {
+        AnalysisTask task = taskService.get(taskId);
+        if (task.status() != TaskStatus.COMPLETED) {
+            throw new TaskNotReadyException("任务尚未完成：" + taskId);
+        }
+    }
+
+    private void validatePage(int page, int size, long minDurationMillis) {
+        if (page < 1) {
+            throw new IllegalArgumentException("page 必须大于或等于 1");
+        }
+        if (size < 1 || size > 200) {
+            throw new IllegalArgumentException("size 必须在 1 到 200 之间");
+        }
+        if (minDurationMillis < 0) {
+            throw new IllegalArgumentException("minDurationMillis 不能小于 0");
+        }
+    }
+
+    private boolean contains(String actual, String expected) {
+        if (expected == null || expected.isBlank()) {
+            return true;
+        }
+        return actual != null && actual.toLowerCase(Locale.ROOT)
+                .contains(expected.trim().toLowerCase(Locale.ROOT));
+    }
+}
+

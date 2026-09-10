@@ -120,7 +120,23 @@ public final class StructuredLogParser implements LogParser {
             return null;
         }
         String remote = stringValue(attr.get("remote"));
-        return remote == null ? stringValue(attr.get("client")) : remote;
+        return remoteAddress(remote == null ? stringValue(attr.get("client")) : remote);
+    }
+
+    private String remoteAddress(String remote) {
+        if (remote == null || remote.isBlank()) {
+            return null;
+        }
+        if (remote.startsWith("[")) {
+            int end = remote.indexOf(']');
+            return end > 1 ? remote.substring(1, end) : remote;
+        }
+        int firstColon = remote.indexOf(':');
+        int lastColon = remote.lastIndexOf(':');
+        if (firstColon > 0 && firstColon == lastColon && remote.substring(lastColon + 1).matches("\\d+")) {
+            return remote.substring(0, lastColon);
+        }
+        return remote;
     }
 
     private Long timestamp(Object value) {

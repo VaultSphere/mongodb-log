@@ -32,7 +32,7 @@ class StructuredLogParserTest {
         assertThat(entry.cpuNanos()).isEqualTo(2_100_000L);
         assertThat(entry.responseLength()).isEqualTo(5_120L);
         assertThat(entry.planSummary()).isEqualTo("IXSCAN { status: 1 }");
-        assertThat(entry.remote()).isEqualTo("10.0.0.8:41712");
+        assertThat(entry.remote()).isEqualTo("10.0.0.8");
         assertThat(entry.queryPattern()).isEqualTo("{\"amount\":{\"$gt\":\"?\"},\"status\":\"?\"}");
         assertThat(entry.slowQuery()).isTrue();
         assertThat(entry.fileIndex()).isEqualTo(2);

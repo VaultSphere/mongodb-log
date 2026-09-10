@@ -1,8 +1,12 @@
 package com.vaultsphere.mongodblog.storage;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
+import com.vaultsphere.mongodblog.analysis.AnalysisAccumulator;
 import com.vaultsphere.mongodblog.analysis.SlowQueryRecord;
+import com.vaultsphere.mongodblog.parser.ParseOutcome;
+import com.vaultsphere.mongodblog.parser.ParsedLogEntry;
 import com.vaultsphere.mongodblog.task.AnalysisTask;
 import com.vaultsphere.mongodblog.task.TaskInputFile;
 import com.vaultsphere.mongodblog.task.TaskStatus;
@@ -57,6 +61,78 @@ class FileTaskRepositoryTest {
         assertThat(recovered.completedAtEpochMillis()).isNotNull();
     }
 
+    @Test
+    void marksAbandonedQueuedTasksFailedOnRestartSoTheyCanBeRemoved() {
+        FileTaskRepository first = repository();
+        first.saveTask(task("queued", TaskStatus.QUEUED, null));
+        FileTaskRepository restarted = repository();
+        assertThat(restarted.findTask("queued").orElseThrow().status()).isEqualTo(TaskStatus.FAILED);
+        restarted.deleteTask("queued");
+        assertThat(repository().findTask("queued")).isEmpty();
+    }
+
+    @Test
+    void readsHistoricalTasksWithoutInventingNewStatistics() throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode taskJson = mapper.valueToTree(task("historical", TaskStatus.COMPLETED, null));
+        taskJson.remove(List.of("logStartEpochMillis", "logEndEpochMillis"));
+        Files.writeString(tempDir.resolve("tasks-index.json"), "[" + taskJson + "]");
+        Path taskDirectory = Files.createDirectories(tempDir.resolve("tasks/historical"));
+        ObjectNode summaryJson = mapper.valueToTree(emptySummary(2, 800));
+        summaryJson.remove(List.of("patternStats", "namespaceResponseBytes", "cpuByOperationBuckets",
+                "averageConnections", "logStartEpochMillis", "logEndEpochMillis"));
+        Files.writeString(taskDirectory.resolve("summary.json"), summaryJson.toString());
+
+        FileTaskRepository repository = repository();
+        AnalysisTask historical = repository.findTask("historical").orElseThrow();
+        AnalysisSummary summary = repository.readSummary("historical");
+        assertThat(historical.logStartEpochMillis()).isNull();
+        assertThat(historical.logEndEpochMillis()).isNull();
+        assertThat(summary.slowQueryCount()).isEqualTo(2);
+        assertThat(summary.totalSlowDurationMillis()).isEqualTo(800);
+        assertThat(summary.patternStats()).isNull();
+        assertThat(summary.namespaceResponseBytes()).isNull();
+        assertThat(summary.cpuByOperationBuckets()).isNull();
+        assertThat(summary.averageConnections()).isNull();
+    }
+
+    @Test
+    void persistsOnlyFiftyPatternSamplesSeparatelyFromGlobalDetailsAndReadsOldRows() throws Exception {
+        AnalysisAccumulator accumulator = new AnalysisAccumulator(1);
+        for (int index = 0; index < 52; index++) {
+            accumulator.accept(ParseOutcome.success(patternEntry(index * 2 + 1, "db.%02d".formatted(index), 10L)));
+            accumulator.accept(ParseOutcome.success(patternEntry(index * 2 + 2, "db.%02d".formatted(index), 20L)));
+        }
+        FileTaskRepository repository = repository();
+        repository.saveTask(task("samples", TaskStatus.COMPLETED, null));
+        repository.saveResult("samples", accumulator.finish(), accumulator.topSlowQueries());
+
+        ObjectMapper mapper = new ObjectMapper();
+        Path summaryPath = tempDir.resolve("tasks/samples/summary.json");
+        ObjectNode saved = (ObjectNode) mapper.readTree(Files.readString(summaryPath));
+        assertThat(saved.path("patternStats").size()).isEqualTo(50);
+        assertThat(saved.path("patternStats").path(49).path("slowestQuery").path("rawLine").asText()).isEqualTo("raw-100");
+        assertThat(Files.readString(summaryPath)).doesNotContain("raw-1\"", "raw-101\"", "raw-102\"", "raw-103\"", "raw-104\"");
+        AnalysisSummary restored = repository.readSummary("samples");
+        assertThat(mapper.writeValueAsString(restored)).isEqualTo(mapper.writeValueAsString(accumulator.finish()));
+        assertThat(repository.readSlowQueries("samples")).hasSize(1);
+        assertThat(repository.readSlowQuery("samples", "0-100")).isEmpty();
+
+        for (var row : saved.path("patternStats")) {
+            ((ObjectNode) row).remove("slowestQuery");
+        }
+        Files.writeString(summaryPath, saved.toString());
+        var historical = mapper.valueToTree(repository.readSummary("samples"));
+        assertThat(historical.path("patternStats").path(0).path("count").asLong()).isEqualTo(2);
+        assertThat(historical.path("patternStats").path(0).path("slowestQuery").isNull()).isTrue();
+    }
+
+    private ParsedLogEntry patternEntry(long line, String namespace, long duration) {
+        return new ParsedLogEntry(line, 0, 1_000 + line, "I", "COMMAND", 51803, "conn", "Slow query",
+                namespace, "find", duration, null, 1L, "IXSCAN", "ip", "p", "raw-" + line,
+                Map.of("durationMillis", duration), true, false);
+    }
+
     private FileTaskRepository repository() {
         return new FileTaskRepository(tempDir, new ObjectMapper().findAndRegisterModules());
     }
@@ -65,14 +141,15 @@ class FileTaskRepositoryTest {
         return new AnalysisTask(
                 id, "测试任务", status, 1_000, status == TaskStatus.QUEUED ? null : 1_100L,
                 null, List.of(new TaskInputFile("mongo.log", "0000-mongo.log", 200)),
-                200, 0, 0, error
+                200, 0, 0, error, null, null
         );
     }
 
     private AnalysisSummary emptySummary(long slowCount, long duration) {
         return new AnalysisSummary(
                 slowCount, slowCount, 0, 0, 0, slowCount, duration, 0, false,
-                List.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of()
+                Map.of(), List.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(),
+                List.of(), Map.of(), Map.of(), List.of(), null, null
         );
     }
 

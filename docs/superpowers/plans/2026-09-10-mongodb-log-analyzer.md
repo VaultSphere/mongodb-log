@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-10-mongodb-log-analyzer-design.md`
 
+> 2026-09-10 更新：Web 开发以 [Web 页面需求](../specs/2026-09-10-web-page-requirements.md) 和 [页面重做计划](2026-09-10-web-page-rebuild.md) 为准。本计划保留为初版实施记录；最新要求为散点＋右侧详情解读、图表／表格切换，以及 Top 50 独立最慢原文样本。下方初版保留策略与布局由上述文档覆盖，真实进度见 ROADMAP.md。
+
 ## Global Constraints
 
 - 应用默认只监听 `127.0.0.1:18080`。

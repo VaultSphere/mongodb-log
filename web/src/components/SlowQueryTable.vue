@@ -37,7 +37,7 @@ onMounted(load)
 
 <template>
   <section class="panel">
-    <div class="section-heading"><div><span>DETAILS</span><h2>最慢 Top 5000</h2></div><small>按耗时从高到低</small></div>
+    <div class="section-heading"><h2>慢查询信息（Top 5000）</h2><small>按耗时从高到低，点击行查看原始日志</small></div>
     <div class="filters">
       <el-input v-model="filters.namespace" clearable placeholder="Namespace" @keyup.enter="search" />
       <el-input v-model="filters.operation" clearable placeholder="Operation" @keyup.enter="search" />
@@ -63,12 +63,10 @@ onMounted(load)
 
 <style scoped>
 .section-heading { display: flex; justify-content: space-between; align-items: flex-start; }
-.section-heading span { color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: .14em; }
-.section-heading h2 { margin: 5px 0 16px; font-size: 20px; }
+.section-heading h2 { margin: 0 0 16px; font-size: 16px; }
 .section-heading small { color: var(--muted); }
 .filters { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr auto auto; gap: 9px; margin-bottom: 16px; }
 .duration { color: #b84e38; }
 .pagination { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 16px; color: var(--muted); font-size: 12px; }
 @media (max-width: 980px) { .filters { grid-template-columns: repeat(2, 1fr); } }
 </style>
-

@@ -1,5 +1,7 @@
 package com.vaultsphere.mongodblog.web;
 
+import com.vaultsphere.mongodblog.task.TaskActiveException;
+import com.vaultsphere.mongodblog.task.TaskDeletionException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MissingServletRequestParameterException;
@@ -27,6 +29,18 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> notReady(TaskNotReadyException error) {
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(new ApiError("TASK_NOT_READY", message(error)));
+    }
+
+    @ExceptionHandler(TaskActiveException.class)
+    public ResponseEntity<ApiError> activeTask(TaskActiveException error) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(new ApiError("TASK_ACTIVE", message(error)));
+    }
+
+    @ExceptionHandler(TaskDeletionException.class)
+    public ResponseEntity<ApiError> deletionFailed(TaskDeletionException error) {
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(new ApiError("TASK_DELETE_FAILED", message(error)));
     }
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)

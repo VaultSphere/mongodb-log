@@ -12,6 +12,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -53,6 +54,7 @@ public class TaskRunner {
         long processedBytes = 0;
         long processedLines = 0;
         Path workDirectory = dataDirectory.resolve("work").resolve(taskId);
+        AnalysisTask terminal = running;
 
         try {
             for (int fileIndex = 0; fileIndex < running.files().size(); fileIndex++) {
@@ -69,16 +71,23 @@ public class TaskRunner {
             }
             AnalysisSummary summary = accumulator.finish();
             repository.saveResult(taskId, summary, accumulator.topSlowQueries());
-            repository.saveTask(running.completed(System.currentTimeMillis(), running.totalBytes(), processedLines));
+            terminal = running.completed(System.currentTimeMillis(), running.totalBytes(), processedLines,
+                    summary.logStartEpochMillis(), summary.logEndEpochMillis());
         } catch (ZipException e) {
-            repository.saveTask(running.progress(processedBytes, processedLines)
-                    .failed(System.currentTimeMillis(), "GZIP 文件损坏：" + safeMessage(e)));
+            terminal = running.progress(processedBytes, processedLines)
+                    .failed(System.currentTimeMillis(), "GZIP 文件损坏：" + safeMessage(e));
         } catch (Exception e) {
-            repository.saveTask(running.progress(processedBytes, processedLines)
-                    .failed(System.currentTimeMillis(), "分析失败：" + safeMessage(e)));
+            terminal = running.progress(processedBytes, processedLines)
+                    .failed(System.currentTimeMillis(), "分析失败：" + safeMessage(e));
         } finally {
-            deleteWorkDirectory(workDirectory);
+            try {
+                deleteWorkDirectory(workDirectory);
+            } catch (IOException e) {
+                String prefix = terminal.errorMessage() == null ? "" : terminal.errorMessage() + "；";
+                terminal = terminal.failed(System.currentTimeMillis(), prefix + "上传副本清理失败：" + safeMessage(e));
+            }
         }
+        repository.saveTask(terminal);
     }
 
     private FileProgress processFile(
@@ -110,20 +119,16 @@ public class TaskRunner {
         return fileName.toLowerCase(Locale.ROOT).endsWith(".gz");
     }
 
-    private void deleteWorkDirectory(Path workDirectory) {
+    private void deleteWorkDirectory(Path workDirectory) throws IOException {
         if (!Files.exists(workDirectory)) {
             return;
         }
         try (var paths = Files.walk(workDirectory)) {
-            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
-                try {
-                    Files.deleteIfExists(path);
-                } catch (IOException ignored) {
-                    path.toFile().deleteOnExit();
-                }
-            });
-        } catch (IOException ignored) {
-            workDirectory.toFile().deleteOnExit();
+            for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) {
+                Files.deleteIfExists(path);
+            }
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
         }
     }
 
@@ -136,4 +141,3 @@ public class TaskRunner {
     private record FileProgress(long processedBytes, long processedLines) {
     }
 }
-

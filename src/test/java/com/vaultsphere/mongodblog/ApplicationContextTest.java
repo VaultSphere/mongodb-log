@@ -5,7 +5,10 @@ import org.springframework.boot.test.context.SpringBootTest;
 
 @SpringBootTest(
         classes = MongoDbLogAnalyzerApplication.class,
-        properties = "mongodblog.data-dir=${java.io.tmpdir}/mongodb-log-context-test"
+        properties = {
+                "mongodblog.data-dir=${java.io.tmpdir}/mongodb-log-context-test",
+                "mongodblog.open-browser=false"
+        }
 )
 class ApplicationContextTest {
 

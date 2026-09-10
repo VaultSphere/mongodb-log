@@ -10,3 +10,4 @@ spring:
 
 mongodblog:
   data-dir: ${user.dir}/data
+  open-browser: true

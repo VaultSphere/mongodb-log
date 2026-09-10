@@ -1,65 +1,45 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import * as echarts from 'echarts'
-import { formatDuration, formatPercent } from '../utils/format.js'
+import { computed, ref } from 'vue'
+import AnalysisChart from './AnalysisChart.vue'
+import MetricHeader from './MetricHeader.vue'
+import { formatDecimal, formatPercent } from '../utils/format.js'
+import MetricPanel from './MetricPanel.vue'
 
 const props = defineProps({ buckets: { type: Array, default: () => [] } })
-const chartElement = ref(null)
-let chart
+const view = ref('chart')
 const hasData = computed(() => props.buckets.some((bucket) => bucket.count > 0))
-
-function renderChart() {
-  if (!hasData.value || !chartElement.value) return
-  if (!chart) chart = echarts.init(chartElement.value)
-  chart.setOption({
-    color: ['#278a65'],
-    grid: { left: 44, right: 18, top: 22, bottom: 48 },
-    tooltip: {
-      trigger: 'axis',
-      formatter: (items) => {
-        const bucket = props.buckets[items[0].dataIndex]
-        return `${bucket.label}<br/>数量：${bucket.count}<br/>占比：${formatPercent(bucket.percentage)}<br/>平均：${formatDuration(bucket.averageDurationMillis)}`
-      },
-    },
-    xAxis: { type: 'category', data: props.buckets.map((bucket) => bucket.label), axisLabel: { rotate: 24 } },
-    yAxis: { type: 'value', name: '慢查询数', minInterval: 1 },
-    series: [{ type: 'bar', data: props.buckets.map((bucket) => bucket.count), barMaxWidth: 42, itemStyle: { borderRadius: [7, 7, 0, 0] } }],
-  })
-}
-
-function resize() { chart?.resize() }
-onMounted(() => { nextTick(renderChart); window.addEventListener('resize', resize) })
-watch(() => props.buckets, () => nextTick(renderChart), { deep: true })
-onBeforeUnmount(() => { window.removeEventListener('resize', resize); chart?.dispose() })
+const option = computed(() => ({
+  color: ['#4c947d'],
+  grid: { left: 55, right: 24, top: 30, bottom: 48 },
+  tooltip: { trigger: 'axis', renderMode: 'richText', formatter: (items) => {
+    const bucket = props.buckets[items[0].dataIndex]
+    return bucket.label + '\n数量：' + bucket.count + '\n占比：' + formatPercent(bucket.percentage) + '\n平均耗时：' + formatDecimal(bucket.averageDurationMillis) + ' ms'
+  } },
+  xAxis: { type: 'category', data: props.buckets.map((bucket) => bucket.label),
+    axisTick: { show: false }, axisLine: { lineStyle: { color: '#dbe2e9' } }, axisLabel: { color: '#7c8998', fontSize: 11 } },
+  yAxis: { type: 'value', name: '慢查询数', minInterval: 1,
+    splitLine: { lineStyle: { color: '#eff2f5', type: 'dashed' } } },
+  series: [{ type: 'bar', data: props.buckets.map((bucket) => bucket.count), barMaxWidth: 44,
+    itemStyle: { borderRadius: [5, 5, 0, 0] }, label: { show: true, position: 'top', color: '#6f7e8c', fontSize: 11,
+      formatter: (item) => props.buckets[item.dataIndex].count + ' · ' + formatPercent(props.buckets[item.dataIndex].percentage) } }],
+}))
 </script>
 
 <template>
-  <section class="panel chart-panel">
-    <div class="section-heading"><div><span>慢查询</span><h2>耗时区间分布</h2></div><small>统计范围：全部慢查询</small></div>
-    <div v-if="!hasData" class="empty-state">暂无慢查询耗时数据</div>
-    <div v-else ref="chartElement" class="chart"></div>
-    <div class="bucket-table" role="table">
-      <div class="bucket-row header"><span>区间</span><span>数量</span><span>占比</span><span>平均</span><span>最大</span></div>
-      <div v-for="bucket in buckets" :key="bucket.key" class="bucket-row" :data-bucket-key="bucket.key">
-        <strong>{{ bucket.label }}</strong>
-        <span>{{ bucket.count.toLocaleString() }}</span>
-        <span>{{ formatPercent(bucket.percentage) }}</span>
-        <span>{{ formatDuration(bucket.averageDurationMillis) }}</span>
-        <span>{{ formatDuration(bucket.maxDurationMillis) }}</span>
-      </div>
+  <MetricPanel layout-key="duration" :min-height="300" class="duration-panel" data-metric="duration">
+    <MetricHeader v-model:view="view" title="慢查询耗时分布" subtitle="全部慢查询 · 8 个耗时区间"
+      description="统计全部慢查询落入各耗时区间的数量和占比，不受 Top 5000 保留限制。区间左闭右开；悬停查看数量、占比和平均耗时，数据表提供精确毫秒值。" />
+    <AnalysisChart v-if="view === 'chart' && hasData" :option="option" :height="290" />
+    <p v-else-if="view === 'chart'" class="empty-state">暂无慢查询耗时数据</p>
+    <div v-else class="data-table-scroll">
+      <table class="data-table numeric-table">
+        <thead><tr><th>耗时区间</th><th>慢查询数</th><th>占全部慢查询</th><th>平均耗时</th><th>最大耗时</th></tr></thead>
+        <tbody><tr v-for="bucket in buckets" :key="bucket.key" :data-bucket-key="bucket.key">
+          <td>{{ bucket.label }}</td><td>{{ bucket.count.toLocaleString() }}</td><td>{{ formatPercent(bucket.percentage) }}</td>
+          <td>{{ formatDecimal(bucket.averageDurationMillis) }} ms</td><td>{{ formatDecimal(bucket.maxDurationMillis) }} ms</td>
+        </tr></tbody>
+      </table>
+      <p v-if="!buckets.length" class="empty-state">暂无慢查询耗时数据</p>
     </div>
-  </section>
+  </MetricPanel>
 </template>
-
-<style scoped>
-.section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
-.section-heading span { color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: .14em; }
-.section-heading h2 { margin: 5px 0; font-size: 20px; }
-.section-heading small { color: var(--muted); }
-.chart { height: 300px; margin-top: 10px; }
-.empty-state { display: grid; place-items: center; height: 180px; color: var(--muted); background: var(--surface-soft); border-radius: 12px; margin-top: 15px; }
-.bucket-table { margin-top: 14px; overflow-x: auto; }
-.bucket-row { display: grid; grid-template-columns: 1.4fr repeat(4, 1fr); min-width: 590px; padding: 10px 12px; border-top: 1px solid var(--line); font-size: 12px; }
-.bucket-row.header { color: var(--muted); background: var(--surface-soft); border: 0; border-radius: 8px; }
-</style>
-

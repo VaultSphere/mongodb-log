@@ -14,11 +14,12 @@ public final class LegacyLogParser implements LogParser {
     private static final Pattern HEADER = Pattern.compile("^(\\S+)\\s+(\\S+)\\s+(\\S+)\\s+\\[([^]]+)]\\s+(.*)$");
     private static final Pattern LEGACY_TIMESTAMP = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}T");
     private static final Pattern COMMAND_OPERATION = Pattern.compile("command:\\s*(findAndModify|createIndexes|aggregate|insert|getMore|find)\\s*\\{");
-    private static final Pattern DURATION = Pattern.compile("(\\d+)ms\\b");
+    private static final Pattern DURATION = Pattern.compile("(?:^|\\s)([^\\s]+)ms\\s*$");
     private static final Pattern PLAN = Pattern.compile("planSummary:\\s*(\\S+)");
-    private static final Pattern RESPONSE_LENGTH = Pattern.compile("reslen:\\s*(\\d+)");
+    private static final Pattern RESPONSE_LENGTH = Pattern.compile("reslen:\\s*(\\S+)");
     private static final Pattern NETWORK_REMOTE = Pattern.compile("(?:connection accepted from|end connection)\\s+([^ :]+)(?::\\d+)?");
     private static final Pattern LEGACY_KEY = Pattern.compile("([,{\\[]\\s*)([$A-Za-z0-9_.]+)(\\s*:)");
+    private static final Pattern BSON_CONSTRUCTOR = Pattern.compile("(?:new\\s+)?(?:Timestamp|BinData|UUID|ObjectId|NumberLong|NumberInt|ISODate|Date)\\s*\\(");
     private static final DateTimeFormatter TIMESTAMP_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSXX");
 
     private final QueryPatternNormalizer patternNormalizer;
@@ -49,13 +50,12 @@ public final class LegacyLogParser implements LogParser {
         String message = header.group(5);
         String operation = operation(component, message);
         String namespace = namespace(message);
-        Long duration = lastLong(DURATION, message);
+        Long duration = firstLong(DURATION, message);
         String planSummary = firstValue(PLAN, message);
         Long responseLength = firstLong(RESPONSE_LENGTH, message);
         String remote = networkRemote(message);
-        boolean slowQuery = isSlowOperation(operation) && duration != null;
-        boolean heartbeatFailure = message.contains("Heartbeat failed")
-                || message.startsWith("Recovering data from the last clean checkpoint");
+        boolean slowQuery = isSlowOperation(operation);
+        boolean heartbeatFailure = message.contains("Heartbeat failed");
 
         Document command = commandDocument(operation, message).orElse(null);
         boolean patternExpected = slowQuery && !"insert".equals(operation);
@@ -94,6 +94,14 @@ public final class LegacyLogParser implements LogParser {
                 slowQuery,
                 heartbeatFailure
         );
+        if (slowQuery && duration == null) {
+            return ParseOutcome.partial(entry, firstValue(DURATION, message) == null
+                            ? "MISSING_SLOW_QUERY_DURATION" : "INVALID_SLOW_QUERY_DURATION",
+                    "慢查询缺少有效的非负整数耗时，未纳入耗时统计");
+        }
+        if (slowQuery && firstValue(RESPONSE_LENGTH, message) != null && responseLength == null) {
+            return ParseOutcome.partial(entry, "INVALID_SLOW_QUERY_METRICS", "响应大小不是有效的非负整数，已排除异常指标");
+        }
         if (patternExpected && command == null) {
             return ParseOutcome.partial(entry, "LEGACY_COMMAND_PARTIAL", "命令主体不是完整的可解析 BSON 文档");
         }
@@ -119,7 +127,7 @@ public final class LegacyLogParser implements LogParser {
             case "findAndModify" -> command.get("query");
             case "getMore" -> BalancedDocumentExtractor.extractAfter(message, "originatingCommand:")
                     .flatMap(this::parseLegacyDocument)
-                    .map(document -> document.get("filter"))
+                    .map(document -> document.containsKey("pipeline") ? document.get("pipeline") : document.get("filter"))
                     .orElse(null);
             case "createIndexes" -> command.get("indexes");
             default -> null;
@@ -127,7 +135,8 @@ public final class LegacyLogParser implements LogParser {
     }
 
     private Optional<Document> parseLegacyDocument(String document) {
-        Matcher matcher = LEGACY_KEY.matcher(document);
+        String sanitized = replaceBsonConstructors(document);
+        Matcher matcher = LEGACY_KEY.matcher(sanitized);
         StringBuilder json = new StringBuilder();
         while (matcher.find()) {
             String replacement = matcher.group(1) + "\"" + matcher.group(2) + "\"" + matcher.group(3);
@@ -139,6 +148,51 @@ public final class LegacyLogParser implements LogParser {
         } catch (RuntimeException invalidBson) {
             return Optional.empty();
         }
+    }
+
+    private String replaceBsonConstructors(String source) {
+        String current = source;
+        Matcher matcher = BSON_CONSTRUCTOR.matcher(current);
+        while (matcher.find()) {
+            int openParenthesis = current.indexOf('(', matcher.start());
+            int end = matchingParenthesis(current, openParenthesis);
+            if (end < 0) {
+                return current;
+            }
+            current = current.substring(0, matcher.start()) + "\"?\"" + current.substring(end + 1);
+            matcher = BSON_CONSTRUCTOR.matcher(current);
+        }
+        return current;
+    }
+
+    private int matchingParenthesis(String source, int start) {
+        int depth = 0;
+        boolean quoted = false;
+        boolean escaped = false;
+        for (int index = start; index < source.length(); index++) {
+            char current = source.charAt(index);
+            if (quoted) {
+                if (escaped) {
+                    escaped = false;
+                } else if (current == '\\') {
+                    escaped = true;
+                } else if (current == '"') {
+                    quoted = false;
+                }
+                continue;
+            }
+            if (current == '"') {
+                quoted = true;
+            } else if (current == '(') {
+                depth++;
+            } else if (current == ')') {
+                depth--;
+                if (depth == 0) {
+                    return index;
+                }
+            }
+        }
+        return -1;
     }
 
     private String operation(String component, String message) {
@@ -193,18 +247,17 @@ public final class LegacyLogParser implements LogParser {
         }
     }
 
-    private Long lastLong(Pattern pattern, String text) {
-        Matcher matcher = pattern.matcher(text);
-        Long value = null;
-        while (matcher.find()) {
-            value = Long.parseLong(matcher.group(1));
-        }
-        return value;
-    }
-
     private Long firstLong(Pattern pattern, String text) {
         String value = firstValue(pattern, text);
-        return value == null ? null : Long.parseLong(value);
+        if (value == null) {
+            return null;
+        }
+        try {
+            long parsed = Long.parseLong(value);
+            return parsed >= 0 ? parsed : null;
+        } catch (NumberFormatException invalid) {
+            return null;
+        }
     }
 
     private String firstValue(Pattern pattern, String text) {
@@ -220,4 +273,3 @@ public final class LegacyLogParser implements LogParser {
         return line.startsWith("\uFEFF") ? line.substring(1) : line;
     }
 }
-

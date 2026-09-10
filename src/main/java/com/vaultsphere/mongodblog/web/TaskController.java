@@ -2,6 +2,8 @@ package com.vaultsphere.mongodblog.web;
 
 import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
 import com.vaultsphere.mongodblog.analysis.SlowQueryRecord;
+import com.vaultsphere.mongodblog.parser.LogParser;
+import com.vaultsphere.mongodblog.parser.ParsedLogEntry;
 import com.vaultsphere.mongodblog.storage.TaskRepository;
 import com.vaultsphere.mongodblog.task.AnalysisTask;
 import com.vaultsphere.mongodblog.task.TaskService;
@@ -10,6 +12,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -18,7 +21,9 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.NoSuchElementException;
 
 @RestController
@@ -26,10 +31,12 @@ import java.util.NoSuchElementException;
 public class TaskController {
     private final TaskService taskService;
     private final TaskRepository repository;
+    private final LogParser parser;
 
-    public TaskController(TaskService taskService, TaskRepository repository) {
+    public TaskController(TaskService taskService, TaskRepository repository, LogParser parser) {
         this.taskService = taskService;
         this.repository = repository;
+        this.parser = parser;
     }
 
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -48,6 +55,12 @@ public class TaskController {
     @GetMapping("/{taskId}")
     public AnalysisTask get(@PathVariable String taskId) {
         return taskService.get(taskId);
+    }
+
+    @DeleteMapping("/{taskId}")
+    public ResponseEntity<Void> delete(@PathVariable String taskId) {
+        taskService.delete(taskId);
+        return ResponseEntity.noContent().build();
     }
 
     @GetMapping("/{taskId}/summary")
@@ -79,11 +92,30 @@ public class TaskController {
         return new SlowQueryPage(page, size, filtered.size(), filtered.subList(from, to));
     }
 
-    @GetMapping("/{taskId}/slow-queries/{queryId}")
-    public SlowQueryRecord slowQuery(@PathVariable String taskId, @PathVariable String queryId) {
+    @GetMapping("/{taskId}/slow-query-points")
+    public SlowQueryScatterResponse slowQueryPoints(@PathVariable String taskId) {
         requireCompleted(taskId);
-        return repository.readSlowQuery(taskId, queryId)
+        Map<String, List<List<Object>>> grouped = new LinkedHashMap<>();
+        for (SlowQueryRecord record : repository.readSlowQueries(taskId)) {
+            String namespace = record.namespace() == null || record.namespace().isBlank()
+                    ? "unknown"
+                    : record.namespace();
+            grouped.computeIfAbsent(namespace, ignored -> new java.util.ArrayList<>())
+                    .add(List.of(record.timestampEpochMillis(), record.durationMillis(), record.queryId()));
+        }
+        return new SlowQueryScatterResponse(grouped.entrySet().stream()
+                .map(entry -> new SlowQueryScatterResponse.Series(entry.getKey(), List.copyOf(entry.getValue())))
+                .toList());
+    }
+
+    @GetMapping("/{taskId}/slow-queries/{queryId}")
+    public SlowQueryDetail slowQuery(@PathVariable String taskId, @PathVariable String queryId) {
+        requireCompleted(taskId);
+        SlowQueryRecord record = repository.readSlowQuery(taskId, queryId)
                 .orElseThrow(() -> new NoSuchElementException("慢查询不存在：" + queryId));
+        ParsedLogEntry entry = parser.parse(record.rawLine(), record.lineNumber(), record.fileIndex()).entry().orElse(null);
+        return new SlowQueryDetail(record, entry == null ? null : entry.messageId(), entry == null ? null : entry.severity(),
+                entry == null ? null : entry.component(), entry == null ? null : entry.context(), entry == null ? null : entry.message());
     }
 
     private void requireCompleted(String taskId) {
@@ -113,4 +145,3 @@ public class TaskController {
                 .contains(expected.trim().toLowerCase(Locale.ROOT));
     }
 }
-

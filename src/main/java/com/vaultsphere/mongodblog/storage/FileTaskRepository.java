@@ -6,6 +6,8 @@ import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
 import com.vaultsphere.mongodblog.analysis.SlowQueryRecord;
 import com.vaultsphere.mongodblog.task.AnalysisTask;
 import com.vaultsphere.mongodblog.task.TaskStatus;
+import com.vaultsphere.mongodblog.task.TaskActiveException;
+import com.vaultsphere.mongodblog.task.TaskDeletionException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Repository;
@@ -13,11 +15,15 @@ import org.springframework.stereotype.Repository;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -56,6 +62,78 @@ public class FileTaskRepository implements TaskRepository {
         Path taskDirectory = tasksDirectory.resolve(task.id());
         writeJson(taskDirectory.resolve("metadata.json"), task);
         writeJson(indexFile, listTasks());
+    }
+
+    @Override
+    public synchronized void deleteTask(String id) {
+        if (id == null || !id.matches("[A-Za-z0-9][A-Za-z0-9_-]*")) {
+            throw new IllegalArgumentException("任务 ID 包含非法字符");
+        }
+        AnalysisTask task = requireTask(id);
+        if (task.status() != TaskStatus.COMPLETED && task.status() != TaskStatus.FAILED) {
+            throw new TaskActiveException("排队中或分析中的任务不能删除");
+        }
+        try {
+            validateDirectory(dataDirectory);
+            validateDirectory(tasksDirectory);
+            Path workDirectory = dataDirectory.resolve("work");
+            validateDirectory(workDirectory);
+            validateIndexFile(indexFile);
+            validateIndexFile(indexFile.resolveSibling(indexFile.getFileName() + ".tmp"));
+            List<Path> taskPaths = deletionPaths(tasksDirectory.resolve(id));
+            List<Path> workPaths = deletionPaths(workDirectory.resolve(id));
+            for (Path path : workPaths) {
+                Files.delete(path);
+            }
+            for (Path path : taskPaths) {
+                Files.delete(path);
+            }
+            writeJson(indexFile, listTasks().stream().filter(existing -> !existing.id().equals(id)).toList());
+            tasks.remove(id);
+        } catch (IOException | UncheckedIOException | IllegalStateException error) {
+            throw new TaskDeletionException("删除任务失败，任务记录已保留，请检查本地文件权限或异常链接后重试", error);
+        }
+    }
+
+    private List<Path> deletionPaths(Path directory) throws IOException {
+        if (!validateDirectory(directory)) {
+            return List.of();
+        }
+        try (var paths = Files.walk(directory)) {
+            List<Path> result = paths.sorted(Comparator.reverseOrder()).toList();
+            for (Path path : result) {
+                if (Files.isSymbolicLink(path)) {
+                    throw new IOException("任务目录包含符号链接：" + path.getFileName());
+                }
+            }
+            return result;
+        }
+    }
+
+    private boolean validateDirectory(Path directory) throws IOException {
+        BasicFileAttributes attributes = attributesIfPresent(directory);
+        if (attributes == null) {
+            return false;
+        }
+        if (attributes.isSymbolicLink() || !attributes.isDirectory()) {
+            throw new IOException("任务存储路径不是普通目录：" + directory.getFileName());
+        }
+        return true;
+    }
+
+    private void validateIndexFile(Path path) throws IOException {
+        BasicFileAttributes attributes = attributesIfPresent(path);
+        if (attributes != null && (attributes.isSymbolicLink() || !attributes.isRegularFile())) {
+            throw new IOException("任务索引路径不是普通文件：" + path.getFileName());
+        }
+    }
+
+    private BasicFileAttributes attributesIfPresent(Path path) throws IOException {
+        try {
+            return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        } catch (NoSuchFileException missing) {
+            return null;
+        }
     }
 
     @Override
@@ -135,7 +213,7 @@ public class FileTaskRepository implements TaskRepository {
 
     private void recoverInterruptedTasks() {
         List<AnalysisTask> interrupted = tasks.values().stream()
-                .filter(task -> task.status() == TaskStatus.RUNNING)
+                .filter(task -> task.status() == TaskStatus.RUNNING || task.status() == TaskStatus.QUEUED)
                 .toList();
         long now = System.currentTimeMillis();
         for (AnalysisTask task : interrupted) {
@@ -186,4 +264,3 @@ public class FileTaskRepository implements TaskRepository {
         void write(Path path) throws IOException;
     }
 }
-

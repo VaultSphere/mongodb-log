@@ -2,6 +2,7 @@ package com.vaultsphere.mongodblog.parser;
 
 import org.bson.Document;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.Date;
@@ -47,7 +48,7 @@ public final class StructuredLogParser implements LogParser {
         Document originatingCommand = attr == null ? null : asDocument(attr.get("originatingCommand"));
         String message = stringValue(root.get("msg"));
         Long duration = numberValue(attr, "durationMillis");
-        boolean slowQuery = "Slow query".equalsIgnoreCase(message) || duration != null;
+        boolean slowQuery = "Slow query".equalsIgnoreCase(message);
         String operation = operation(command, attr);
 
         try {
@@ -73,6 +74,14 @@ public final class StructuredLogParser implements LogParser {
                     slowQuery,
                     message != null && message.contains("Heartbeat failed")
             );
+            if (slowQuery && duration == null) {
+                boolean missing = attr == null || attr.get("durationMillis") == null;
+                return ParseOutcome.partial(entry, missing ? "MISSING_SLOW_QUERY_DURATION" : "INVALID_SLOW_QUERY_DURATION",
+                        "慢查询缺少有效的非负整数耗时，未纳入耗时统计");
+            }
+            if (slowQuery && (invalidNumber(attr, "cpuNanos") || invalidNumber(attr, "reslen"))) {
+                return ParseOutcome.partial(entry, "INVALID_SLOW_QUERY_METRICS", "CPU 或响应大小不是有效的非负整数，已排除异常指标");
+            }
             return ParseOutcome.success(entry);
         } catch (RuntimeException e) {
             ParsedLogEntry entry = new ParsedLogEntry(
@@ -95,20 +104,23 @@ public final class StructuredLogParser implements LogParser {
         return switch (operation) {
             case "find" -> command.get("filter");
             case "aggregate" -> command.get("pipeline");
+            case "update" -> command.get("updates") instanceof List<?> updates
+                    ? updates.stream().map(this::asDocument).map(statement -> statement == null ? null : statement.get("q")).toList()
+                    : command.get("q");
             case "delete" -> command.get("deletes");
             case "findAndModify" -> command.get("query");
-            case "getMore" -> originatingCommand == null ? null : originatingCommand.get("filter");
+            case "getMore" -> originatingCommand == null ? null : originatingCommand.containsKey("pipeline")
+                    ? originatingCommand.get("pipeline") : originatingCommand.get("filter");
             case "createIndexes" -> command.get("indexes");
             default -> command.get("q");
         };
     }
 
     private String operation(Document command, Document attr) {
-        if (command != null) {
-            for (String candidate : COMMAND_OPERATIONS) {
-                if (command.containsKey(candidate)) {
-                    return candidate;
-                }
+        if (command != null && !command.isEmpty()) {
+            String commandName = command.keySet().iterator().next();
+            if (COMMAND_OPERATIONS.contains(commandName)) {
+                return commandName;
             }
         }
         String type = attr == null ? null : stringValue(attr.get("type"));
@@ -186,17 +198,21 @@ public final class StructuredLogParser implements LogParser {
             return null;
         }
         Object value = source.get(key);
-        if (value instanceof Number number) {
-            return number.longValue();
-        }
-        if (value instanceof String text) {
-            try {
-                return Long.parseLong(text);
-            } catch (NumberFormatException ignored) {
-                return null;
+        try {
+            Long parsed = null;
+            if (value instanceof Number number) {
+                parsed = new BigDecimal(number.toString()).longValueExact();
+            } else if (value instanceof String text) {
+                parsed = Long.parseLong(text);
             }
+            return parsed != null && parsed >= 0 ? parsed : null;
+        } catch (NumberFormatException | ArithmeticException invalid) {
+            return null;
         }
-        return null;
+    }
+
+    private boolean invalidNumber(Document source, String key) {
+        return source != null && source.get(key) != null && numberValue(source, key) == null;
     }
 
     private Integer integerValue(Object value) {

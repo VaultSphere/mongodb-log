@@ -19,6 +19,10 @@ export function fetchTasks() {
   return request('/api/tasks')
 }
 
+export function deleteTask(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' })
+}
+
 export function fetchTask(taskId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}`)
 }
@@ -39,3 +43,6 @@ export function fetchSlowQuery(taskId, queryId) {
   return request(`/api/tasks/${encodeURIComponent(taskId)}/slow-queries/${encodeURIComponent(queryId)}`)
 }
 
+export function fetchSlowQueryPoints(taskId) {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/slow-query-points`)
+}

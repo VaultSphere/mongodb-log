@@ -7,6 +7,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.time.OffsetDateTime;
 import java.util.stream.Stream;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -82,6 +83,19 @@ class LegacyLogParserTest {
     }
 
     @Test
+    void preservesQueryPatternWhenLegacyCommandContainsBsonConstructors() {
+        String line = "2025-03-10T13:28:38.624+0800 I COMMAND [conn49] command local.oplog.rs command: find "
+                + "{ find: \"oplog.rs\", filter: { state: \"A\" }, $clusterTime: { clusterTime: Timestamp(1741584518, 113), "
+                + "signature: { hash: BinData(0, 00000000), keyId: 0 } }, lsid: { id: UUID(\"082721d0-b41f\") } } "
+                + "planSummary: IXSCAN reslen:1756 325ms";
+
+        ParseOutcome outcome = parser.parse(line, 1, 0);
+
+        assertThat(outcome.status()).isEqualTo(ParseStatus.SUCCESS);
+        assertThat(outcome.entry().orElseThrow().queryPattern()).isEqualTo("{\"state\":\"?\"}");
+    }
+
+    @Test
     void detectsHeartbeatFailuresAndClassifiesEmptyAndMalformedLines() {
         String heartbeat = "2025-03-10T14:14:17.729+0800 I NETWORK [monitor] Heartbeat failed after 1000ms";
 
@@ -102,5 +116,33 @@ class LegacyLogParserTest {
 
         assertThat(composite.parse(structured, 1, 0).entry().orElseThrow().component()).isEqualTo("NETWORK");
         assertThat(composite.parse(legacy, 2, 0).entry().orElseThrow().component()).isEqualTo("NETWORK");
+    }
+
+    @Test
+    void doesNotMisclassifyStorageCheckpointRecoveryAsHeartbeatFailure() {
+        ParsedLogEntry entry = parser.parse("2025-03-10T14:14:17.729+0800 W STORAGE [initandlisten] Recovering data from the last clean checkpoint.", 1, 0).entry().orElseThrow();
+        assertThat(entry.heartbeatFailure()).isFalse();
+    }
+
+    @Test
+    void retainsOriginatingAggregationPipelineForGetMore() {
+        ParsedLogEntry entry = parser.parse("2025-03-10T14:14:17.729+0800 I COMMAND [conn1] command db.items command: getMore { getMore: 1, collection: \"items\" } originatingCommand: { aggregate: \"items\", pipeline: [ { $match: { state: \"A\" } } ], cursor: {} } 100ms", 1, 0).entry().orElseThrow();
+        assertThat(entry.queryPattern()).isEqualTo("[{\"$match\":{\"state\":\"?\"}}]");
+    }
+
+    @Test
+    void classifiesInvalidOrMissingDurationInsteadOfUsingQueryTextOrThrowing() {
+        String prefix = "2025-03-10T14:14:17.729+0800 I COMMAND [conn1] command db.items command: find { find: \"items\", filter: { note: \"100ms\" } }";
+        for (String suffix : List.of("", " -1ms", " 1.5ms", " 9999999999999999999999999999ms")) {
+            ParseOutcome result = parser.parse(prefix + suffix, 1, 0);
+            assertThat(result.status()).as(suffix).isEqualTo(ParseStatus.PARTIAL);
+            assertThat(result.entry().orElseThrow().durationMillis()).isNull();
+            assertThat(result.errorCode()).isIn("MISSING_SLOW_QUERY_DURATION", "INVALID_SLOW_QUERY_DURATION");
+        }
+        ParseOutcome invalidResponse = parser.parse(prefix + " reslen:9999999999999999999999999 100ms", 1, 0);
+        assertThat(invalidResponse.status()).isEqualTo(ParseStatus.PARTIAL);
+        assertThat(invalidResponse.errorCode()).isEqualTo("INVALID_SLOW_QUERY_METRICS");
+        assertThat(invalidResponse.entry().orElseThrow().responseLength()).isNull();
+        assertThat(invalidResponse.entry().orElseThrow().durationMillis()).isEqualTo(100L);
     }
 }

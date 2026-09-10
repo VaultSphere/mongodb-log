@@ -4,19 +4,25 @@ import { ElMessage } from 'element-plus'
 import { fetchSummary, fetchTask, fetchTasks } from './api/tasks.js'
 import UploadPanel from './components/UploadPanel.vue'
 import TaskList from './components/TaskList.vue'
-import SummaryCards from './components/SummaryCards.vue'
+import StatisticsTables from './components/StatisticsTables.vue'
 import DurationHistogram from './components/DurationHistogram.vue'
 import BreakdownCharts from './components/BreakdownCharts.vue'
 import PatternTable from './components/PatternTable.vue'
-import SlowQueryTable from './components/SlowQueryTable.vue'
-import SlowQueryDetail from './components/SlowQueryDetail.vue'
+import SlowQueryScatter from './components/SlowQueryScatter.vue'
+import SlowQueryDrawer from './components/SlowQueryDrawer.vue'
+import { formatBytes, formatTimeRange } from './utils/format.js'
 
 const tasks = ref([])
 const selectedTask = ref(null)
 const summary = ref(null)
-const selectedQuery = ref(null)
-const detailVisible = ref(false)
+const detailSelection = ref(null)
+const summaryLoading = ref(false)
+const summaryError = ref('')
+const progressError = ref('')
 let timer
+let pollingVersion = 0
+let listVersion = 0
+let summaryVersion = 0
 
 const progress = computed(() => {
   const task = selectedTask.value
@@ -26,18 +32,29 @@ const progress = computed(() => {
 })
 
 async function loadTasks() {
+  const request = ++listVersion
   try {
-    tasks.value = await fetchTasks()
-    if (!selectedTask.value && tasks.value.length) await selectTask(tasks.value[0])
+    const result = await fetchTasks()
+    if (request === listVersion) tasks.value = result
   } catch (error) {
-    ElMessage.error(error.message)
+    if (request === listVersion) ElMessage.error(error.message)
   }
+}
+
+function taskDeleted(id) {
+  ++listVersion
+  tasks.value = tasks.value.filter(task => task.id !== id)
 }
 
 async function selectTask(task) {
   stopPolling()
+  ++summaryVersion
+  summaryLoading.value = false
+  progressError.value = ''
+  detailSelection.value = null
   selectedTask.value = task
   summary.value = null
+  summaryError.value = ''
   if (task.status === 'COMPLETED') {
     await loadSummary(task.id)
   } else if (task.status === 'QUEUED' || task.status === 'RUNNING') {
@@ -46,17 +63,30 @@ async function selectTask(task) {
 }
 
 async function loadSummary(taskId) {
+  const request = ++summaryVersion
+  summaryLoading.value = true
+  summaryError.value = ''
   try {
-    summary.value = await fetchSummary(taskId)
+    const result = await fetchSummary(taskId)
+    if (request === summaryVersion && selectedTask.value?.id === taskId) summary.value = result
   } catch (error) {
-    ElMessage.error(error.message)
+    if (request === summaryVersion && selectedTask.value?.id === taskId) summaryError.value = error.message
+  } finally {
+    if (request === summaryVersion && selectedTask.value?.id === taskId) summaryLoading.value = false
   }
 }
 
 function startPolling(taskId) {
+  stopPolling()
+  const version = pollingVersion
+  let pending = false
+  progressError.value = ''
   timer = window.setInterval(async () => {
+    if (pending) return
+    pending = true
     try {
       const task = await fetchTask(taskId)
+      if (version !== pollingVersion || selectedTask.value?.id !== taskId) return
       selectedTask.value = task
       const index = tasks.value.findIndex((item) => item.id === task.id)
       if (index >= 0) tasks.value.splice(index, 1, task)
@@ -66,105 +96,203 @@ function startPolling(taskId) {
         await loadTasks()
       }
     } catch (error) {
-      stopPolling()
-      ElMessage.error(error.message)
+      if (version === pollingVersion && selectedTask.value?.id === taskId) {
+        stopPolling()
+        progressError.value = error.message
+      }
+    } finally {
+      pending = false
     }
   }, 1000)
 }
 
 function stopPolling() {
+  ++pollingVersion
   if (timer) window.clearInterval(timer)
   timer = undefined
 }
 
+function resetLayout() {
+  try {
+    localStorage.removeItem('mongodb-log:metric-layout:v1')
+    window.dispatchEvent(new Event('mongodb-log:reset-layout'))
+    ElMessage.success('已恢复默认布局')
+  } catch { ElMessage.error('浏览器未允许修改本地布局') }
+}
+
 async function taskCreated(task) {
+  ++listVersion
   tasks.value.unshift(task)
   await selectTask(task)
 }
 
-function showDetail(query) {
-  selectedQuery.value = query
-  detailVisible.value = true
+async function backToTasks() {
+  stopPolling()
+  ++summaryVersion
+  summaryLoading.value = false
+  detailSelection.value = null
+  selectedTask.value = null
+  summary.value = null
+  await loadTasks()
 }
 
 onMounted(loadTasks)
-onBeforeUnmount(stopPolling)
+onBeforeUnmount(() => { stopPolling(); ++listVersion; ++summaryVersion })
 </script>
 
 <template>
-  <header class="topbar">
-    <div class="brand-mark">M</div>
-    <div><strong>MongoDB Log Analyzer</strong><span>本机离线分析</span></div>
-    <div class="privacy"><i></i>数据不离开当前电脑</div>
-  </header>
-  <main class="shell">
-    <section class="hero">
-      <div><span class="kicker">OPERATIONS TOOLKIT</span><h1>把慢日志变成可行动的答案</h1></div>
-      <p>流式扫描全部日志，精确统计慢查询耗时分布，只永久保存耗时最长的 Top 5000 明细。</p>
-    </section>
-    <UploadPanel @created="taskCreated" />
-    <div class="workspace">
-      <TaskList :tasks="tasks" :selected-id="selectedTask?.id" @select="selectTask" />
-      <section class="results">
-        <div v-if="!selectedTask" class="panel welcome-state">
-          <strong>等待第一个分析任务</strong><span>上传日志后，这里会展示结果。</span>
-        </div>
-        <template v-else>
-          <section class="panel task-status">
-            <div><span>当前任务</span><h2>{{ selectedTask.name }}</h2></div>
-            <el-progress v-if="['QUEUED', 'RUNNING'].includes(selectedTask.status)" :percentage="progress" :stroke-width="10" />
-            <el-alert v-if="selectedTask.status === 'FAILED'" :title="selectedTask.errorMessage" type="error" :closable="false" show-icon />
-          </section>
-          <template v-if="summary">
-            <SummaryCards :summary="summary" />
-            <div class="chart-grid">
-              <DurationHistogram :buckets="summary.durationDistribution" />
-              <BreakdownCharts :summary="summary" />
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand">
+        <strong>MongoDB Log</strong><span>日志分析</span>
+      </div>
+      <div class="offline-state">本地工作区</div>
+    </header>
+
+    <main class="page-container">
+      <el-card class="workspace-card" shadow="never">
+        <template v-if="!selectedTask">
+          <div class="page-title">
+            <div>
+              <h1>日志任务</h1>
+              <p>上传 MongoDB 日志，查看统计与慢查询明细</p>
             </div>
-            <PatternTable :patterns="summary.patterns" />
-            <SlowQueryTable :task-id="selectedTask.id" @select="showDetail" />
-          </template>
+          </div>
+          <el-divider />
+          <UploadPanel @created="taskCreated" />
+          <TaskList :tasks="tasks" @select="selectTask" @deleted="taskDeleted" />
         </template>
-      </section>
-    </div>
-  </main>
-  <SlowQueryDetail v-model="detailVisible" :query="selectedQuery" />
+
+        <template v-else>
+          <div class="detail-header">
+            <button class="back-button" type="button" @click="backToTasks">← 返回任务列表</button>
+            <div class="detail-title">
+              <div>
+                <h1>日志分析报告</h1>
+                <p>{{ selectedTask.name }}</p>
+              </div>
+              <el-tag v-if="selectedTask.status === 'COMPLETED'" type="success">分析完成</el-tag>
+              <el-tag v-else-if="selectedTask.status === 'FAILED'" type="danger">分析失败</el-tag>
+              <el-tag v-else type="warning">分析中</el-tag>
+            </div>
+          </div>
+          <el-divider />
+
+          <section class="task-overview">
+            <div><span>日志文件</span><strong :title="selectedTask.files.map((file) => file.originalName).join('、')">{{ selectedTask.files.map((file) => file.originalName).join('、') }}</strong></div>
+            <div><span>文件大小</span><strong>{{ formatBytes(selectedTask.totalBytes) }}</strong></div>
+            <div class="log-range"><span>日志时间范围</span><strong>{{ formatTimeRange(selectedTask.logStartEpochMillis, selectedTask.logEndEpochMillis) }}</strong></div>
+          </section>
+          <div v-if="['QUEUED', 'RUNNING'].includes(selectedTask.status)" class="task-progress">
+            <el-progress :percentage="progress" :stroke-width="10" />
+          </div>
+          <el-alert v-if="selectedTask.status === 'FAILED'" :title="selectedTask.errorMessage" type="error" :closable="false" show-icon />
+          <div v-if="progressError" class="request-error" role="alert"><span>进度读取失败：{{ progressError }}</span><el-button size="small" @click="startPolling(selectedTask.id)">重试进度</el-button></div>
+
+          <p v-if="summaryLoading" role="status">正在加载分析结果…</p>
+          <div v-if="summaryError" role="alert"><p>{{ summaryError }}</p><el-button @click="loadSummary(selectedTask.id)">重试分析结果</el-button></div>
+          <section v-if="summary" :key="selectedTask.id" class="results">
+            <details v-if="summary.failedLines || summary.partialLines || summary.skippedLines" class="parse-notice">
+              <summary>解析提示：失败 {{ summary.failedLines || 0 }} 行，部分解析 {{ summary.partialLines || 0 }} 行，跳过 {{ summary.skippedLines || 0 }} 行</summary>
+              <p>统计仅包含成功提取的字段。失败行未计入分析，部分解析行可能缺少查询模式等字段；跳过行不属于可识别的 MongoDB 日志或为空行。</p>
+              <ul v-if="Object.keys(summary.parseErrors || {}).length"><li v-for="(count, reason) in summary.parseErrors" :key="reason"><code>{{ reason }}</code>：{{ count }} 行</li></ul>
+            </details>
+            <div class="layout-toolbar"><span>{{ summary.totalLines == null ? '分析结果' : summary.totalLines.toLocaleString() + ' 行日志' }} · {{ (summary.slowQueryCount || 0).toLocaleString() }} 条慢查询</span><button type="button" class="text-button" title="窗口大小已自动保存在此浏览器，可拖动右下角调整" @click="resetLayout">恢复默认布局</button></div>
+            <StatisticsTables :summary="summary" />
+            <DurationHistogram :buckets="summary.durationDistribution" />
+            <PatternTable :patterns="summary.patternStats" @select="sample => detailSelection = { sample }" />
+            <BreakdownCharts :summary="summary" />
+            <SlowQueryScatter :task-id="selectedTask.id" @select="queryId => detailSelection = { queryId }" />
+            <SlowQueryDrawer :task-id="selectedTask.id" :selection="detailSelection" @close="detailSelection = null" />
+          </section>
+        </template>
+      </el-card>
+    </main>
+  </div>
 </template>
 
 <style>
 :root {
-  --text: #17233b;
-  --muted: #6d788c;
-  --line: #e1e7ec;
-  --surface-soft: #f4f7f8;
-  --green: #21845e;
-  --green-dark: #176445;
-  --blue: #406fae;
+  --el-color-primary: #347961;
+  --el-color-primary-light-3: #70a18e;
+  --el-color-primary-light-5: #aac8bb;
+  --el-color-primary-light-7: #d0e3da;
+  --el-color-primary-light-9: #eff6f2;
+  --el-color-success: #4f9477;
+  --el-border-radius-base: 7px;
+  --text: #344455;
+  --muted: #64748b;
+  --line: #e1e6eb;
+  --surface-soft: #f6f8fa;
 }
 * { box-sizing: border-box; }
-body { margin: 0; color: var(--text); background: #eff3f4; font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif; }
+html { background: #f4f6f8; }
+body { margin: 0; color: var(--text); background: #f4f6f8; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; -webkit-font-smoothing: antialiased; }
 button, input { font: inherit; }
-.topbar { height: 66px; display: flex; align-items: center; gap: 11px; padding: 0 max(24px, calc((100vw - 1480px) / 2)); background: #10271f; color: #fff; box-shadow: 0 5px 22px rgba(16, 39, 31, .18); }
-.brand-mark { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 11px; background: #36a77a; font-weight: 900; }
-.topbar strong, .topbar span { display: block; }
-.topbar span { margin-top: 2px; color: #a8cabb; font-size: 10px; letter-spacing: .12em; }
-.privacy { margin-left: auto; color: #c7ded4; font-size: 12px; }
-.privacy i { display: inline-block; width: 7px; height: 7px; margin-right: 7px; border-radius: 50%; background: #54d89f; box-shadow: 0 0 0 4px rgba(84, 216, 159, .12); }
-.shell { max-width: 1480px; margin: 0 auto; padding: 30px 24px 60px; }
-.hero { display: flex; align-items: end; justify-content: space-between; gap: 40px; padding: 8px 4px 24px; }
-.hero h1 { margin: 6px 0 0; font-size: clamp(28px, 4vw, 43px); letter-spacing: -.045em; }
-.hero p { max-width: 520px; margin: 0 0 4px; color: var(--muted); line-height: 1.8; }
-.kicker { color: var(--green); font-size: 11px; font-weight: 900; letter-spacing: .18em; }
-.panel { padding: 22px; border: 1px solid rgba(216, 225, 229, .95); border-radius: 18px; background: rgba(255, 255, 255, .96); box-shadow: 0 12px 34px rgba(28, 53, 46, .055); }
-.workspace { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 18px; align-items: start; margin-top: 18px; }
-.results { display: grid; gap: 16px; min-width: 0; }
-.chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.welcome-state { min-height: 230px; display: grid; place-content: center; text-align: center; }
-.welcome-state strong { font-size: 20px; }
-.welcome-state span { margin-top: 8px; color: var(--muted); }
-.task-status { display: grid; grid-template-columns: minmax(200px, .7fr) 1fr; align-items: center; gap: 30px; }
-.task-status span { color: var(--muted); font-size: 11px; }
-.task-status h2 { margin: 5px 0 0; font-size: 20px; }
-@media (max-width: 1100px) { .workspace { grid-template-columns: 1fr; } .chart-grid { grid-template-columns: 1fr; } }
-@media (max-width: 720px) { .hero { display: block; } .hero p { margin-top: 14px; } .task-status { grid-template-columns: 1fr; } .privacy { display: none; } }
+.app-shell { min-height: 100vh; }
+.app-header { display: flex; align-items: center; justify-content: space-between; height: 54px; padding: 0 28px; color: #263c36; background: #fff; border-bottom: 1px solid #dce3e8; }
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand strong { font-size: 15px; font-weight: 650; }
+.brand span { padding-left: 12px; border-left: 1px solid #dce3e8; color: #64748b; font-size: 12px; }
+.offline-state { color: #64748b; font-size: 12px; }
+.page-container { max-width: 1600px; margin: 0 auto; padding: 24px 28px 40px; }
+.workspace-card { min-width: 0; border: 0; border-radius: 0; background: transparent; overflow: visible; }
+.workspace-card > .el-card__body { padding: 0; }
+.workspace-card > .el-card__body > .el-divider { display: none; }
+.page-title, .detail-title { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+.page-title { margin: 4px 0 26px; }
+.page-title h1, .detail-title h1 { margin: 0; color: #253344; font-size: 22px; line-height: 1.35; font-weight: 600; }
+.page-title p, .detail-title p { margin: 7px 0 0; color: #64748b; font-size: 12px; }
+.detail-header { margin-bottom: 18px; }
+.back-button { display: inline-block; padding: 0; margin-bottom: 15px; border: 0; color: #7b8d8a; background: transparent; font-size: 12px; cursor: pointer; }
+.back-button:hover { color: #347961; }
+.task-overview { display: grid; grid-template-columns: 1.4fr .65fr 1.6fr; gap: 16px; margin-bottom: 16px; padding: 15px 18px; border: 1px solid #dce3e8; border-radius: 5px; background: #fff; }
+.task-overview > div { min-width: 0; }
+.task-overview span, .task-overview strong { display: block; }
+.task-overview span { margin-bottom: 6px; color: #64748b; font-size: 11px; }
+.task-overview strong { color: #4d5e6b; font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+.task-progress { margin: 0 0 20px; }
+.panel { min-width: 0; padding: 18px; border: 1px solid #dce3e8; border-radius: 5px; background: #fff; }
+.results { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.layout-toolbar { display: flex; justify-content: space-between; gap: 12px; color: #64748b; font-size: 12px; }
+.request-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; color: #9c472c; background: #fff7ed; }
+.parse-notice { padding: 12px 16px; border: 1px solid #e8d9bd; border-radius: 4px; background: #fffbf2; color: #785a28; font-size: 12px; line-height: 1.8; }
+.parse-notice summary { cursor: pointer; font-weight: 500; }
+.parse-notice p, .parse-notice ul { margin: 8px 0 0; }
+.chart-grid, .statistics-grid { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; min-width: 0; }
+.chart-grid > .panel, .statistics-grid > .panel { flex: 0 0 auto; width: calc((100% - 16px) / 2); }
+.statistics-grid > .panel:not(.is-sized) { height: 254px; }
+.results > .panel { width: 100%; }
+.chart-grid > * { min-width: 0; }
+.section-note { color: #64748b; font-size: 11px; line-height: 1.7; }
+.empty-state { display: grid; place-items: center; min-height: 140px; margin: 0; padding: 24px; color: #91a0aa; text-align: center; background: #fafbfc; border: 1px dashed #e6ecf0; border-radius: 8px; font-size: 12px; line-height: 1.8; }
+.data-table-scroll { max-height: 320px; overflow: auto; scrollbar-width: thin; scrollbar-color: #d9e2e8 transparent; }
+.chart-table { height: 280px; }
+.data-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+.data-table th, .data-table td { text-align: left; padding: 9px 10px; border-bottom: 1px solid #eaf0f4; overflow-wrap: anywhere; }
+.data-table th { position: sticky; top: 0; z-index: 1; color: #596b7d; background: #f2f5f8; font-weight: 500; font-size: 11px; }
+.data-table tbody tr:last-child td { border-bottom: 0; }
+.data-table tbody tr:hover td { background: #f8fafb; }
+.numeric-table th:nth-child(n+2), .numeric-table td:nth-child(n+2) { text-align: right; }
+.text-button { padding: 0; border: 0; color: #3e8066; background: transparent; font-size: 12px; cursor: pointer; }
+.text-button:hover { color: #215c44; }
+.metric-help-tooltip { max-width: 340px; padding: 12px 14px !important; font-size: 12px !important; line-height: 1.8 !important; }
+.el-button { font-weight: 450; }
+.el-tag { border-radius: 5px; font-size: 11px; }
+@media (max-width: 900px) {
+  .page-container { padding: 22px 18px 36px; }
+  .task-overview { grid-template-columns: 1fr 1fr; }
+  .task-overview .log-range { grid-column: 1 / -1; }
+}
+@media (max-width: 760px) {
+  .chart-grid > .panel, .statistics-grid > .panel { width: 100%; }
+  .page-title h1, .detail-title h1 { font-size: 22px; }
+  .app-header { padding: 0 18px; }
+}
+@media (max-width: 480px) {
+  .page-container { padding: 18px 12px 30px; }
+  .panel { padding: 16px; }
+  .task-overview { padding: 16px; gap: 14px; }
+  .offline-state { padding: 5px 8px; font-size: 10px; }
+}
 </style>

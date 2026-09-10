@@ -9,12 +9,17 @@ import com.vaultsphere.mongodblog.parser.StructuredLogParser;
 import com.vaultsphere.mongodblog.storage.FileTaskRepository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.GZIPOutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,6 +51,12 @@ class TaskRunnerTest {
         AnalysisSummary summary = repository.readSummary(task.id());
         assertThat(completed.status()).isEqualTo(TaskStatus.COMPLETED);
         assertThat(completed.processedLines()).isEqualTo(2);
+        assertThat(completed.logStartEpochMillis()).isEqualTo(1717236930123L);
+        assertThat(completed.logEndEpochMillis()).isEqualTo(java.time.Instant.parse("2025-03-10T05:28:38.624Z").toEpochMilli());
+        assertThat(summary.logStartEpochMillis()).isEqualTo(completed.logStartEpochMillis());
+        assertThat(summary.logEndEpochMillis()).isEqualTo(completed.logEndEpochMillis());
+        assertThat(summary.patternStats()).hasSize(2);
+        assertThat(summary.patternStats()).allSatisfy(stat -> assertThat(stat.slowestQueryId()).isNotNull());
         assertThat(summary.slowQueryCount()).isEqualTo(2);
         assertThat(repository.readSlowQueries(task.id()))
                 .extracting(record -> record.durationMillis())
@@ -74,6 +85,62 @@ class TaskRunnerTest {
         assertThat(work).doesNotExist();
     }
 
+    @Test
+    void publishesTerminalStatusOnlyAfterUploadCleanupToAvoidDeleteRaces() throws Exception {
+        AtomicBoolean workExistedAtCompletion = new AtomicBoolean();
+        FileTaskRepository repository = new FileTaskRepository(dataDir, new ObjectMapper()) {
+            @Override
+            public synchronized void saveTask(AnalysisTask task) {
+                if (task.status() == TaskStatus.COMPLETED) {
+                    workExistedAtCompletion.set(Files.exists(dataDir.resolve("work").resolve(task.id())));
+                }
+                super.saveTask(task);
+            }
+        };
+        Path work = Files.createDirectories(dataDir.resolve("work/cleanup-first"));
+        Path input = Files.writeString(work.resolve("mongo.log"), Files.readString(Path.of("src/test/resources/fixtures/structured.log")));
+        repository.saveTask(task("cleanup-first", List.of(new TaskInputFile("mongo.log", "mongo.log", Files.size(input)))));
+        runner(repository).run("cleanup-first");
+        assertThat(repository.findTask("cleanup-first").orElseThrow().status()).isEqualTo(TaskStatus.COMPLETED);
+        assertThat(workExistedAtCompletion).isFalse();
+    }
+
+    @Test
+    @EnabledOnOs({OS.MAC, OS.LINUX})
+    void reportsUploadCleanupFailureInsteadOfSilentlyCompleting() throws Exception {
+        FileTaskRepository repository = repository();
+        Path work = Files.createDirectories(dataDir.resolve("work/cleanup-failure"));
+        Path input = Files.writeString(work.resolve("mongo.log"), Files.readString(Path.of("src/test/resources/fixtures/structured.log")));
+        repository.saveTask(task("cleanup-failure", List.of(new TaskInputFile("mongo.log", "mongo.log", Files.size(input)))));
+        Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(work);
+        try {
+            Files.setPosixFilePermissions(work, Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_EXECUTE));
+            runner(repository).run("cleanup-failure");
+            AnalysisTask failed = repository.findTask("cleanup-failure").orElseThrow();
+            assertThat(failed.status()).isEqualTo(TaskStatus.FAILED);
+            assertThat(failed.errorMessage()).contains("上传副本清理失败");
+            assertThat(input).exists();
+        } finally {
+            Files.setPosixFilePermissions(work, permissions);
+        }
+    }
+
+    @Test
+    void continuesAfterMalformedNumericMetricsAndCountsTheirErrors() throws Exception {
+        FileTaskRepository repository = repository();
+        Path work = Files.createDirectories(dataDir.resolve("work/numeric-errors"));
+        String malformed = "2025-03-10T14:14:17.729+0800 I COMMAND [conn1] command db.items command: find { find: \"items\", filter: {} } 99999999999999999999999999999ms";
+        Path input = Files.writeString(work.resolve("mongo.log"), malformed + "\n" + Files.readString(Path.of("src/test/resources/fixtures/structured.log")));
+        repository.saveTask(task("numeric-errors", List.of(new TaskInputFile("mongo.log", "mongo.log", Files.size(input)))));
+        runner(repository).run("numeric-errors");
+        assertThat(repository.findTask("numeric-errors").orElseThrow().status()).isEqualTo(TaskStatus.COMPLETED);
+        AnalysisSummary summary = repository.readSummary("numeric-errors");
+        assertThat(summary.totalLines()).isEqualTo(2);
+        assertThat(summary.partialLines()).isEqualTo(1);
+        assertThat(summary.parseErrors()).containsEntry("INVALID_SLOW_QUERY_DURATION", 1L);
+        assertThat(summary.slowQueryCount()).isEqualTo(1);
+    }
+
     private TaskRunner runner(FileTaskRepository repository) {
         QueryPatternNormalizer normalizer = new QueryPatternNormalizer();
         return new TaskRunner(
@@ -92,7 +159,7 @@ class TaskRunnerTest {
 
     private AnalysisTask task(String id, List<TaskInputFile> files) {
         long totalBytes = files.stream().mapToLong(TaskInputFile::sizeBytes).sum();
-        return new AnalysisTask(id, id, TaskStatus.QUEUED, 1_000, null, null, files, totalBytes, 0, 0, null);
+        return new AnalysisTask(id, id, TaskStatus.QUEUED, 1_000, null, null, files, totalBytes, 0, 0, null, null, null);
     }
 
     private void writeGzip(Path path, String text) throws IOException {

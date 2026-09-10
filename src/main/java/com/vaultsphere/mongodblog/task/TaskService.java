@@ -67,7 +67,7 @@ public class TaskService {
         String taskName = name == null || name.isBlank() ? inputs.get(0).originalName() : name.trim();
         AnalysisTask task = new AnalysisTask(
                 id, taskName, TaskStatus.QUEUED, System.currentTimeMillis(), null, null,
-                List.copyOf(inputs), totalBytes, 0, 0, null
+                List.copyOf(inputs), totalBytes, 0, 0, null, null, null
         );
         repository.saveTask(task);
         executor.execute(() -> runner.run(id));
@@ -80,6 +80,10 @@ public class TaskService {
 
     public List<AnalysisTask> list() {
         return repository.listTasks();
+    }
+
+    public void delete(String id) {
+        repository.deleteTask(id);
     }
 
     private void validateFiles(List<MultipartFile> files) {

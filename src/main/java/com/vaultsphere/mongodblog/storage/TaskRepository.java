@@ -10,6 +10,8 @@ import java.util.Optional;
 public interface TaskRepository {
     void saveTask(AnalysisTask task);
 
+    void deleteTask(String id);
+
     Optional<AnalysisTask> findTask(String id);
 
     List<AnalysisTask> listTasks();
@@ -22,4 +24,3 @@ public interface TaskRepository {
 
     Optional<SlowQueryRecord> readSlowQuery(String taskId, String queryId);
 }
-

@@ -32,6 +32,7 @@ class TaskControllerIntegrationTest {
     @DynamicPropertySource
     static void dataDirectory(DynamicPropertyRegistry registry) {
         registry.add("mongodblog.data-dir", () -> dataDir.toString());
+        registry.add("mongodblog.open-browser", () -> "false");
     }
 
     @Autowired
@@ -53,6 +54,8 @@ class TaskControllerIntegrationTest {
 
         JsonNode task = waitForTerminalTask(taskId);
         assertThat(task.path("status").asText()).isEqualTo("COMPLETED");
+        assertThat(task.path("logStartEpochMillis").asLong()).isEqualTo(1717236930123L);
+        assertThat(task.path("logEndEpochMillis").asLong()).isEqualTo(1717236930123L);
 
         mockMvc.perform(get("/api/tasks/{id}/summary", taskId))
                 .andExpect(status().isOk())
@@ -65,6 +68,29 @@ class TaskControllerIntegrationTest {
                 .andExpect(jsonPath("$.total").value(1))
                 .andExpect(jsonPath("$.content[0].durationMillis").value(742))
                 .andExpect(jsonPath("$.content[0].rawLine").isString());
+
+        MvcResult pointsResult = mockMvc.perform(get("/api/tasks/{id}/slow-query-points", taskId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.series[0].name").value("sales.orders"))
+                .andExpect(jsonPath("$.series[0].data[0][1]").value(742))
+                .andExpect(jsonPath("$.series[0].data[0][2]").isNotEmpty())
+                .andReturn();
+        assertThat(pointsResult.getResponse().getContentAsString())
+                .doesNotContain("rawLine", "attributes", "queryPattern");
+
+        String queryId = objectMapper.readTree(pointsResult.getResponse().getContentAsString())
+                .path("series").path(0).path("data").path(0).path(2).asText();
+        mockMvc.perform(get("/api/tasks/{id}/slow-queries/{queryId}", taskId, queryId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.queryId").value(queryId))
+                .andExpect(jsonPath("$.id").value(51803))
+                .andExpect(jsonPath("$.timestampEpochMillis").value(1717236930123L))
+                .andExpect(jsonPath("$.severity").value("I"))
+                .andExpect(jsonPath("$.component").value("COMMAND"))
+                .andExpect(jsonPath("$.context").value("conn12"))
+                .andExpect(jsonPath("$.message").value("Slow query"))
+                .andExpect(jsonPath("$.attributes.ns").value("sales.orders"))
+                .andExpect(jsonPath("$.rawLine").isString());
     }
 
     @Test
@@ -77,6 +103,24 @@ class TaskControllerIntegrationTest {
         mockMvc.perform(get("/api/tasks/missing"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("NOT_FOUND"));
+    }
+
+    @Test
+    void exposesLegacyLogMetadataWithoutInventingAMessageId() throws Exception {
+        String line = Files.readString(Path.of("src/test/resources/fixtures/legacy.log")).lines().findFirst().orElseThrow();
+        MockMultipartFile file = new MockMultipartFile("files", "legacy.log", "text/plain", line.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        MvcResult create = mockMvc.perform(multipart("/api/tasks").file(file)).andExpect(status().isAccepted()).andReturn();
+        String taskId = objectMapper.readTree(create.getResponse().getContentAsString()).path("id").asText();
+        assertThat(waitForTerminalTask(taskId).path("status").asText()).isEqualTo("COMPLETED");
+        mockMvc.perform(get("/api/tasks/{id}/slow-queries/0-1", taskId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.severity").value("I"))
+                .andExpect(jsonPath("$.component").value("COMMAND"))
+                .andExpect(jsonPath("$.context").value("conn49"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.startsWith("command local.oplog.rs")))
+                .andExpect(jsonPath("$.attributes.find").value("oplog.rs"))
+                .andExpect(jsonPath("$.rawLine").value(line));
     }
 
     @Test

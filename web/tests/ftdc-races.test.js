@@ -41,4 +41,30 @@ describe('FTDC request ownership', () => {
     wrapper.unmount()
   })
 
+  it('does not overlap status polling requests for the same task', async () => {
+    vi.useFakeTimers()
+    const running = { ...task, status: 'RUNNING' }
+    let resolvePoll
+    const fetch = vi.fn(url => {
+      if (url === '/api/ftdc-tasks') return reply([running])
+      if (url === '/api/ftdc-tasks/task') return new Promise(resolve => { resolvePoll = () => resolve({ ok: true, text: async () => JSON.stringify(running) }) })
+      throw new Error(`unexpected ${url}`)
+    })
+    vi.stubGlobal('fetch', fetch)
+    const wrapper = mount(FtdcWorkspace, { global: { plugins: [ElementPlus], stubs: { FtdcTaskList: taskList, FtdcUploadPanel: true, FtdcMetricGroupChart: groupChart } } })
+    await flushPromises()
+    await wrapper.find('button').trigger('click')
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(fetch.mock.calls.filter(([url]) => url === '/api/ftdc-tasks/task')).toHaveLength(1)
+
+    resolvePoll()
+    await flushPromises()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(fetch.mock.calls.filter(([url]) => url === '/api/ftdc-tasks/task')).toHaveLength(2)
+    wrapper.unmount()
+    vi.useRealTimers()
+  })
+
 })

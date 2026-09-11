@@ -10,6 +10,7 @@ import org.bson.BsonString;
 import org.bson.BsonTimestamp;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -79,5 +80,54 @@ class FtdcBlockScannerTest {
         assertThatThrownBy(() -> new FtdcBlockScanner().scan(valid, 19, 2))
                 .isInstanceOf(FtdcFormatException.class)
                 .hasMessageContaining("block 2");
+    }
+
+    @Test
+    void rejectsExcessiveSamplesAndMetricSampleProductBeforeDecodingRle() {
+        BsonDocument baseline = new BsonDocument("start", new BsonDateTime(1));
+        byte[] excessiveSamples = FtdcFixtureBuilder.compressedBlockData(
+                baseline, 1, FtdcBlockScanner.MAX_SAMPLES_PER_BLOCK, new byte[]{0, 0});
+        byte[] excessiveProduct = FtdcFixtureBuilder.compressedBlockData(
+                baseline, 10_000, 100, new byte[]{0, 0});
+
+        assertThatThrownBy(() -> new FtdcBlockScanner().scan(excessiveSamples, 0, 0))
+                .isInstanceOf(FtdcFormatException.class)
+                .hasMessageContaining("样本数量非法");
+        assertThatThrownBy(() -> new FtdcBlockScanner().scan(excessiveProduct, 0, 0))
+                .isInstanceOf(FtdcFormatException.class)
+                .hasMessageContaining("指标与样本乘积");
+    }
+
+    @Test
+    void rejectsTrailingCompressedDataAndDeclaredLengthMismatch() {
+        BsonDocument baseline = new BsonDocument("start", new BsonDateTime(1));
+        byte[] valid = FtdcFixtureBuilder.block(baseline, List.of(new long[]{1, 2}))
+                .getBinary("data").getData();
+        byte[] trailing = Arrays.copyOf(valid, valid.length + 1);
+        trailing[trailing.length - 1] = 7;
+        byte[] truncated = Arrays.copyOf(valid, valid.length - 2);
+        byte[] wrongLength = valid.clone();
+        wrongLength[0]++;
+
+        assertThatThrownBy(() -> new FtdcBlockScanner().scan(trailing, 0, 0))
+                .isInstanceOf(FtdcFormatException.class)
+                .hasMessageContaining("剩余压缩数据");
+        assertThatThrownBy(() -> new FtdcBlockScanner().scan(wrongLength, 0, 0))
+                .isInstanceOf(FtdcFormatException.class)
+                .hasMessageContaining("实际解压长度");
+        assertThatThrownBy(() -> new FtdcBlockScanner().scan(truncated, 0, 0))
+                .isInstanceOf(FtdcFormatException.class)
+                .hasMessageContaining("zlib");
+    }
+
+    @Test
+    void rejectsRleThatExceedsTheDeclaredMetricCells() {
+        BsonDocument baseline = new BsonDocument("start", new BsonDateTime(1));
+        byte[] invalidRle = FtdcFixtureBuilder.compressedBlockData(
+                baseline, 1, 1, new byte[]{0, 2});
+
+        assertThatThrownBy(() -> new FtdcBlockScanner().scan(invalidRle, 0, 0))
+                .isInstanceOf(FtdcFormatException.class)
+                .hasMessageContaining("零游程超出声明");
     }
 }

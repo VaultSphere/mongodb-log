@@ -9,7 +9,7 @@ import FtdcMetricGroupChart from './FtdcMetricGroupChart.vue'
 
 const tasks = ref([]), selectedTask = ref(null)
 const groups = ref([]), selectedGroupIds = ref([]), groupResults = ref([]), groupKeyword = ref('')
-const view = ref('raw'), groupLoading = ref(false), error = ref('')
+const view = ref('raw'), groupLoading = ref(false), error = ref(''), groupFailureSummary = ref('')
 const collapseAllCommand = ref(null), hideZeroAllCommand = ref(null)
 const statusLabels = { QUEUED: '排队中', RUNNING: '建立索引中', COMPLETED: '分析完成', FAILED: '分析失败' }
 const coreGroupNames = new Set([
@@ -21,6 +21,7 @@ const coreGroupNames = new Set([
 ])
 const coreGroupPrefixes = ['systemMetrics/cpu', 'systemMetrics/memory', 'systemMetrics/disks/']
 let pollTimer, groupVersion = 0
+const pendingPollTasks = new Set()
 let chartCommandVersion = 0
 let groupController
 const progress = computed(() => selectedTask.value?.totalBytes ? Math.min(99, Math.round(selectedTask.value.processedBytes * 100 / selectedTask.value.totalBytes)) : 0)
@@ -38,7 +39,7 @@ const coreGroups = computed(() => groups.value.filter(group => coreGroupNames.ha
 
 async function loadTasks() { try { tasks.value = await fetchFtdcTasks() } catch (e) { ElMessage.error(e.message) } }
 async function selectTask(task) {
-  cancelRequests(); stopPolling(); selectedTask.value = task; error.value = ''
+  cancelRequests(); stopPolling(); selectedTask.value = task; error.value = ''; groupFailureSummary.value = ''
   groupKeyword.value = ''; groups.value = []; selectedGroupIds.value = []; groupResults.value = []
   if (task.status === 'COMPLETED') await loadGroups()
   else if (['QUEUED','RUNNING'].includes(task.status)) startPolling(task.id)
@@ -52,14 +53,26 @@ async function loadGroups() {
 async function querySelectedGroups() {
   if (!selectedGroupIds.value.length) return
   const groupIds = [...selectedGroupIds.value]
-  groupController?.abort(); const version = ++groupVersion; groupController = new AbortController(); groupLoading.value = true; groupResults.value = []; error.value = ''
+  groupController?.abort(); const version = ++groupVersion; groupController = new AbortController(); groupLoading.value = true; groupResults.value = []; error.value = ''; groupFailureSummary.value = ''
   try {
     const results = []
+    let failed = 0
     for (const groupId of groupIds) {
-      const result = await fetchFtdcGroupSeries(selectedTask.value.id, groupId, { maxPoints: 1200, view: view.value }, groupController.signal)
-      if (version !== groupVersion) return
-      results.push(result)
+      try {
+        const result = await fetchFtdcGroupSeries(selectedTask.value.id, groupId, { maxPoints: 1200, view: view.value }, groupController.signal)
+        if (version !== groupVersion) return
+        results.push(result)
+      } catch (e) {
+        if (e.name === 'AbortError' || version !== groupVersion) return
+        const selected = groups.value.find(group => group.groupId === groupId)
+        results.push({ groupId, name: selected?.name || groupId, error: e.message })
+        failed++
+      }
       groupResults.value = [...results]
+    }
+    if (failed) {
+      groupFailureSummary.value = `${failed} 个指标组加载失败，其他指标组已继续加载`
+      ElMessage.warning(groupFailureSummary.value)
     }
   } catch (e) { if (e.name !== 'AbortError' && version === groupVersion) error.value = e.message }
   finally { if (version === groupVersion) groupLoading.value = false }
@@ -68,12 +81,12 @@ async function changeView(next) {
   view.value = next
   if (selectedGroupIds.value.length) await querySelectedGroups()
 }
-function selectionChanged() { groupResults.value = [] }
+function selectionChanged() { groupResults.value = []; groupFailureSummary.value = '' }
 function selectCoreGroups() { selectedGroupIds.value = coreGroups.value.map(group => group.groupId); selectionChanged() }
 function clearGroupSelection() { selectedGroupIds.value = []; selectionChanged() }
 function setAllCollapsed(value) { collapseAllCommand.value = { value, version: ++chartCommandVersion } }
 function setAllHideZero(value) { hideZeroAllCommand.value = { value, version: ++chartCommandVersion } }
-function startPolling(id) { pollTimer = window.setInterval(async () => { try { const task = await fetchFtdcTask(id); if (selectedTask.value?.id !== id) return; selectedTask.value = task; if (['COMPLETED','FAILED'].includes(task.status)) { stopPolling(); await loadTasks(); if (task.status === 'COMPLETED') await loadGroups() } } catch (e) { stopPolling(); error.value = e.message } }, 1000) }
+function startPolling(id) { pollTimer = window.setInterval(async () => { if (pendingPollTasks.has(id)) return; pendingPollTasks.add(id); try { const task = await fetchFtdcTask(id); if (selectedTask.value?.id !== id) return; selectedTask.value = task; if (['COMPLETED','FAILED'].includes(task.status)) { stopPolling(); await loadTasks(); if (task.status === 'COMPLETED') await loadGroups() } } catch (e) { stopPolling(); error.value = e.message } finally { pendingPollTasks.delete(id) } }, 1000) }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null }
 function cancelRequests() { ++groupVersion; groupController?.abort() }
 function created(task) { tasks.value.unshift(task); selectTask(task) }
@@ -129,12 +142,18 @@ onMounted(loadTasks); onBeforeUnmount(() => { cancelRequests(); stopPolling() })
         <p v-if="groupLoading && !groupResults.length" class="empty-state">正在按顺序读取所选指标组…</p>
         <p v-else-if="!groupResults.length" class="empty-state">请先在上方选择指标组并查询</p>
         <p v-if="groupLoading && groupResults.length" class="loading-note">已加载 {{ groupResults.length }}／{{ selectedGroupIds.length }} 个指标组，正在继续读取其余指标组…</p>
-        <div v-if="groupResults.length" class="chart-grid"><FtdcMetricGroupChart v-for="group in groupResults" :key="group.groupId" :group="group" :collapse-command="collapseAllCommand" :hide-zero-command="hideZeroAllCommand" /></div>
+        <el-alert v-if="groupFailureSummary" class="group-failure-summary" type="warning" :title="groupFailureSummary" :closable="false" />
+        <div v-if="groupResults.length" class="chart-grid">
+          <template v-for="group in groupResults" :key="group.groupId">
+            <section v-if="group.error" class="group-error-card"><strong>{{ group.name }}</strong><span>{{ group.error }}</span></section>
+            <FtdcMetricGroupChart v-else :group="group" :collapse-command="collapseAllCommand" :hide-zero-command="hideZeroAllCommand" />
+          </template>
+        </div>
       </section>
     </template>
   </div>
 </template>
 
 <style scoped>
-.ftdc-dashboard{display:flex;flex-direction:column;gap:18px}.ftdc-dashboard>.page-title,.ftdc-dashboard>.back-button{margin-bottom:0}.card,.charts-section{min-width:0;padding:18px 20px;border:1px solid #d6e2f2;border-radius:16px;background:#fff;box-shadow:0 6px 20px rgba(43,73,93,.05)}.ftdc-status-card{display:flex;flex-direction:column;gap:16px}.ftdc-overview{grid-template-columns:1.1fr .45fr .7fr 1.45fr;margin:0;border:0;padding:15px 0 0;border-top:1px solid #edf1f5;border-radius:0}.card-header,.charts-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}.card-header h2,.charts-header h2{margin:0;color:#2f4050;font-size:16px}.card-header p,.charts-header p{margin:5px 0 0;color:#7a8996;font-size:12px}.query-form{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}.group-filter-input{width:100%}.group-select{width:100%}.group-shortcuts,.batch-chart-actions{display:flex;flex-wrap:wrap;gap:8px}.query-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#7b8995;font-size:11px}.charts-section{display:flex;flex-direction:column}.chart-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;padding:12px;border-radius:10px;background:#f7f9fb}.batch-chart-actions :deep(.el-button+.el-button){margin-left:0}.toolbar-note{margin-left:auto;color:#7b8995;font-size:11px}.loading-note{margin:0 0 12px;color:#71808d;font-size:12px}.chart-grid{display:flex;flex-direction:column;gap:14px}.empty-state{margin:0}@media(max-width:900px){.ftdc-overview{grid-template-columns:1fr 1fr}}@media(max-width:620px){.card,.charts-section{padding:16px}.card-header{flex-direction:column}.chart-toolbar{align-items:flex-start}.toolbar-note{width:100%;margin-left:0}.query-actions{align-items:flex-start;flex-direction:column}}
+.ftdc-dashboard{display:flex;flex-direction:column;gap:18px}.ftdc-dashboard>.page-title,.ftdc-dashboard>.back-button{margin-bottom:0}.card,.charts-section{min-width:0;padding:18px 20px;border:1px solid #d6e2f2;border-radius:16px;background:#fff;box-shadow:0 6px 20px rgba(43,73,93,.05)}.ftdc-status-card{display:flex;flex-direction:column;gap:16px}.ftdc-overview{grid-template-columns:1.1fr .45fr .7fr 1.45fr;margin:0;border:0;padding:15px 0 0;border-top:1px solid #edf1f5;border-radius:0}.card-header,.charts-header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}.card-header h2,.charts-header h2{margin:0;color:#2f4050;font-size:16px}.card-header p,.charts-header p{margin:5px 0 0;color:#7a8996;font-size:12px}.query-form{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}.group-filter-input{width:100%}.group-select{width:100%}.group-shortcuts,.batch-chart-actions{display:flex;flex-wrap:wrap;gap:8px}.query-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#7b8995;font-size:11px}.charts-section{display:flex;flex-direction:column}.chart-toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px;padding:12px;border-radius:10px;background:#f7f9fb}.batch-chart-actions :deep(.el-button+.el-button){margin-left:0}.toolbar-note{margin-left:auto;color:#7b8995;font-size:11px}.loading-note{margin:0 0 12px;color:#71808d;font-size:12px}.group-failure-summary{margin-bottom:12px}.chart-grid{display:flex;flex-direction:column;gap:14px}.group-error-card{display:flex;flex-direction:column;gap:6px;padding:14px;border:1px solid #f2c6c6;border-radius:12px;background:#fff6f6}.group-error-card strong{color:#8c3535;font-size:14px}.group-error-card span{color:#a85b5b;font-size:12px}.empty-state{margin:0}@media(max-width:900px){.ftdc-overview{grid-template-columns:1fr 1fr}}@media(max-width:620px){.card,.charts-section{padding:16px}.card-header{flex-direction:column}.chart-toolbar{align-items:flex-start}.toolbar-note{width:100%;margin-left:0}.query-actions{align-items:flex-start;flex-direction:column}}
 </style>

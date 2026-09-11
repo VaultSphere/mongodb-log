@@ -20,6 +20,9 @@ function validValues(series) {
 }
 
 function stats(series) {
+  if (series.min != null && series.max != null && series.average != null) {
+    return { min: series.min, max: series.max, average: series.average }
+  }
   const values = validValues(series)
   if (!values.length) return null
   return {
@@ -34,33 +37,8 @@ function format(value) {
   return Number.isInteger(value) ? value.toLocaleString() : value.toLocaleString(undefined, { maximumFractionDigits: 2 })
 }
 
-function typicalInterval(timestamps) {
-  const counts = new Map()
-  for (let index = 1; index < timestamps.length; index++) {
-    const interval = timestamps[index] - timestamps[index - 1]
-    if (interval > 0) counts.set(interval, (counts.get(interval) || 0) + 1)
-  }
-  let selected = 0, selectedCount = 0
-  for (const [interval, count] of counts) {
-    if (count > selectedCount || (count === selectedCount && interval < selected)) {
-      selected = interval
-      selectedCount = count
-    }
-  }
-  return selected
-}
-
 function chartPoints(series) {
-  const points = []
-  const interval = typicalInterval(series.timestamps || [])
-  for (let index = 0; index < (series.timestamps || []).length; index++) {
-    const timestamp = series.timestamps[index]
-    if (index && interval && timestamp - series.timestamps[index - 1] > interval * 2) {
-      points.push([series.timestamps[index - 1] + interval, null])
-    }
-    points.push([timestamp, series.values[index]])
-  }
-  return points
+  return (series.timestamps || []).map((timestamp, index) => [timestamp, series.values[index]])
 }
 
 function chartSeries(series, index) {
@@ -93,7 +71,10 @@ function option(seriesList) {
 
 const seriesEntries = computed(() => (props.group.series || []).map(series => {
   const summary = stats(series)
-  return { series, summary, zero: summary?.min === 0 && summary?.max === 0 && summary?.average === 0 }
+  const zero = typeof series.allZero === 'boolean'
+    ? series.allZero
+    : summary?.min === 0 && summary?.max === 0 && summary?.average === 0
+  return { series, summary, zero }
 }))
 const zeroCount = computed(() => seriesEntries.value.filter(entry => entry.zero).length)
 const visibleEntries = computed(() => hideZero.value ? seriesEntries.value.filter(entry => !entry.zero) : seriesEntries.value)

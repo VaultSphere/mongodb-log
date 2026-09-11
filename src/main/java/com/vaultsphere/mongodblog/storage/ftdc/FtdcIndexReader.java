@@ -1,5 +1,6 @@
 package com.vaultsphere.mongodblog.storage.ftdc;
 
+import com.vaultsphere.mongodblog.parser.ftdc.FtdcBlockScanner;
 import com.vaultsphere.mongodblog.parser.ftdc.FtdcSchema;
 
 import java.io.EOFException;
@@ -78,6 +79,7 @@ public final class FtdcIndexReader {
                 int schemaId = readInt(channel, cursor);
                 int numAttributes = checkedCount(readInt(channel, cursor), "属性");
                 int numDeltas = checkedCount(readInt(channel, cursor), "delta");
+                FtdcBlockScanner.validateScale(numAttributes, numDeltas, "FTDC 索引：");
                 long start = readLong(channel, cursor);
                 long end = readLong(channel, cursor);
                 long pointOffset = readLong(channel, cursor);
@@ -110,51 +112,36 @@ public final class FtdcIndexReader {
     }
 
     public List<GroupMetricBlockIndex> groupMetricBlocks(List<String> metricPaths) {
+        return groupQuery(metricPaths).blocks();
+    }
+
+    public GroupQueryIndex groupQuery(List<String> metricPaths) {
         if (metricPaths.isEmpty() || metricPaths.size() > 200) {
             throw new IllegalArgumentException("FTDC 指标组必须包含 1 到 200 个指标");
         }
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
             Cursor cursor = readHeader(channel);
-            readFiles(channel, cursor);
+            List<FtdcIndexWriter.SourceFile> files = readFiles(channel, cursor);
             List<FtdcSchema> schemas = readSchemas(channel, cursor);
             List<GroupMetricBlockIndex> result = new ArrayList<>();
             for (int blockNumber = 0; blockNumber < cursor.blockCount; blockNumber++) {
-                FtdcBlockIndex block = readBlock(channel, cursor);
-                FtdcSchema schema = schemas.get(block.schemaId());
-                int timeIndex = schema.indexOf("start");
-                if (timeIndex < 0) continue;
-                int[] metricIndexes = new int[metricPaths.size()];
-                long[] baselines = new long[metricPaths.size()];
-                int[] offsets = new int[metricPaths.size()];
-                int[] zeros = new int[metricPaths.size()];
-                int count = 0;
-                for (int resultIndex = 0; resultIndex < metricPaths.size(); resultIndex++) {
-                    int schemaIndex = schema.indexOf(metricPaths.get(resultIndex));
-                    if (schemaIndex < 0) continue;
-                    metricIndexes[count] = resultIndex;
-                    baselines[count] = block.baseline()[schemaIndex];
-                    offsets[count] = block.deltaOffsets()[schemaIndex];
-                    zeros[count] = block.zerosAtStart()[schemaIndex];
-                    count++;
-                }
-                if (count == 0) continue;
-                result.add(new GroupMetricBlockIndex(block.fileId(), block.blockOrdinal(), block.fileOffset(),
-                        block.documentLength(), block.declaredLength(), block.compressedLength(), block.numDeltas(),
-                        block.startEpochMillis(), block.endEpochMillis(), block.pointOffset(),
-                        Arrays.copyOf(metricIndexes, count), Arrays.copyOf(baselines, count),
-                        Arrays.copyOf(offsets, count), Arrays.copyOf(zeros, count),
-                        block.baseline()[timeIndex], block.deltaOffsets()[timeIndex], block.zerosAtStart()[timeIndex]));
+                GroupMetricBlockIndex block = readGroupBlock(channel, cursor, schemas, metricPaths);
+                if (block != null) result.add(block);
             }
             if (cursor.position != channel.size()) throw new IllegalStateException("FTDC 索引包含多余数据");
-            return List.copyOf(result);
+            return new GroupQueryIndex(files, schemas, result);
         } catch (IOException | RuntimeException e) {
             throw indexError(e);
         }
     }
 
     public void validateSources(Path sourceDirectory) {
+        validateSources(sourceDirectory, files());
+    }
+
+    public void validateSources(Path sourceDirectory, List<FtdcIndexWriter.SourceFile> files) {
         try {
-            for (FtdcIndexWriter.SourceFile expected : files()) {
+            for (FtdcIndexWriter.SourceFile expected : files) {
                 Path source = sourceDirectory.resolve(expected.storedName()).normalize();
                 if (!source.startsWith(sourceDirectory.toAbsolutePath().normalize())) {
                     throw new IllegalStateException("FTDC 源文件路径越界");
@@ -168,6 +155,59 @@ public final class FtdcIndexReader {
         } catch (IOException e) {
             throw new IllegalStateException("FTDC 源文件校验失败：" + e.getMessage(), e);
         }
+    }
+
+    private GroupMetricBlockIndex readGroupBlock(FileChannel channel, Cursor cursor, List<FtdcSchema> schemas,
+                                                  List<String> metricPaths) throws IOException {
+        int fileId = readInt(channel, cursor);
+        int ordinal = readInt(channel, cursor);
+        long fileOffset = readLong(channel, cursor);
+        int documentLength = readInt(channel, cursor);
+        int declaredLength = readInt(channel, cursor);
+        int compressedLength = readInt(channel, cursor);
+        int schemaId = readInt(channel, cursor);
+        int numAttributes = checkedCount(readInt(channel, cursor), "属性");
+        int numDeltas = checkedCount(readInt(channel, cursor), "delta");
+        FtdcBlockScanner.validateScale(numAttributes, numDeltas, "FTDC 索引：");
+        long start = readLong(channel, cursor);
+        long end = readLong(channel, cursor);
+        long pointOffset = readLong(channel, cursor);
+        if (schemaId < 0 || schemaId >= schemas.size() || schemas.get(schemaId).paths().size() != numAttributes) {
+            throw new IllegalStateException("FTDC 索引 schema 与属性数量不一致");
+        }
+        FtdcSchema schema = schemas.get(schemaId);
+        int timeIndex = schema.indexOf("start");
+        int[] schemaIndexes = new int[metricPaths.size()];
+        int[] resultIndexes = new int[metricPaths.size()];
+        int count = 0;
+        for (int resultIndex = 0; resultIndex < metricPaths.size(); resultIndex++) {
+            int schemaIndex = schema.indexOf(metricPaths.get(resultIndex));
+            if (schemaIndex < 0) continue;
+            schemaIndexes[count] = schemaIndex;
+            resultIndexes[count] = resultIndex;
+            count++;
+        }
+        long arraysStart = cursor.position;
+        long offsetsStart = arraysStart + (long) numAttributes * Long.BYTES;
+        long zerosStart = offsetsStart + (long) numAttributes * Integer.BYTES;
+        cursor.position = zerosStart + (long) numAttributes * Integer.BYTES;
+        if (timeIndex < 0 || count == 0) return null;
+
+        int[] metricIndexes = Arrays.copyOf(resultIndexes, count);
+        long[] baselines = new long[count];
+        int[] offsets = new int[count];
+        int[] zeros = new int[count];
+        for (int i = 0; i < count; i++) {
+            int schemaIndex = schemaIndexes[i];
+            baselines[i] = readLongAt(channel, arraysStart + (long) schemaIndex * Long.BYTES);
+            offsets[i] = readIntAt(channel, offsetsStart + (long) schemaIndex * Integer.BYTES);
+            zeros[i] = readIntAt(channel, zerosStart + (long) schemaIndex * Integer.BYTES);
+        }
+        return new GroupMetricBlockIndex(fileId, ordinal, fileOffset, documentLength, declaredLength,
+                compressedLength, numAttributes, numDeltas, start, end, pointOffset, metricIndexes,
+                baselines, offsets, zeros, readLongAt(channel, arraysStart + (long) timeIndex * Long.BYTES),
+                readIntAt(channel, offsetsStart + (long) timeIndex * Integer.BYTES),
+                readIntAt(channel, zerosStart + (long) timeIndex * Integer.BYTES));
     }
 
     private Cursor readHeader(FileChannel channel) throws IOException {
@@ -218,6 +258,7 @@ public final class FtdcIndexReader {
         int schemaId = readInt(channel, cursor);
         int numAttributes = checkedCount(readInt(channel, cursor), "属性");
         int numDeltas = checkedCount(readInt(channel, cursor), "delta");
+        FtdcBlockScanner.validateScale(numAttributes, numDeltas, "FTDC 索引：");
         long start = readLong(channel, cursor);
         long end = readLong(channel, cursor);
         long pointOffset = readLong(channel, cursor);
@@ -321,7 +362,7 @@ public final class FtdcIndexReader {
 
     public record GroupMetricBlockIndex(
             int fileId, int blockOrdinal, long fileOffset, int documentLength, int declaredLength,
-            int compressedLength, int numDeltas, long startEpochMillis, long endEpochMillis, long pointOffset,
+            int compressedLength, int numAttributes, int numDeltas, long startEpochMillis, long endEpochMillis, long pointOffset,
             int[] metricIndexes, long[] metricBaselines, int[] metricDeltaOffsets, int[] metricZerosAtStart,
             long timeBaseline, int timeDeltaOffset, int timeZerosAtStart
     ) {
@@ -334,6 +375,15 @@ public final class FtdcIndexReader {
             if (size != metricBaselines.length || size != metricDeltaOffsets.length || size != metricZerosAtStart.length) {
                 throw new IllegalArgumentException("FTDC 分组指标索引长度不一致");
             }
+        }
+    }
+
+    public record GroupQueryIndex(List<FtdcIndexWriter.SourceFile> files, List<FtdcSchema> schemas,
+                                  List<GroupMetricBlockIndex> blocks) {
+        public GroupQueryIndex {
+            files = List.copyOf(files);
+            schemas = List.copyOf(schemas);
+            blocks = List.copyOf(blocks);
         }
     }
 }

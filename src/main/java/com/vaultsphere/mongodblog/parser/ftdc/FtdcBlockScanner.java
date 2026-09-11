@@ -2,16 +2,16 @@ package com.vaultsphere.mongodblog.parser.ftdc;
 
 import org.bson.RawBsonDocument;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Arrays;
-import java.util.zip.InflaterInputStream;
+import java.util.zip.DataFormatException;
+import java.util.zip.Inflater;
 
 public final class FtdcBlockScanner {
-    public static final int MAX_UNCOMPRESSED_BLOCK_BYTES = 256 * 1024 * 1024;
+    public static final int MAX_UNCOMPRESSED_BLOCK_BYTES = 10_000_000;
+    public static final int MAX_SAMPLES_PER_BLOCK = 100_000;
+    public static final long MAX_METRIC_SAMPLE_CELLS = 1_000_000;
 
     private final FtdcBaselineFlattener flattener = new FtdcBaselineFlattener();
     private final FtdcVarIntReader varInts = new FtdcVarIntReader();
@@ -27,16 +27,14 @@ public final class FtdcBlockScanner {
             if (baselineLength < 5 || baselineLength > payload.length - 8) {
                 throw new FtdcFormatException(location + "baseline BSON 长度非法：" + baselineLength);
             }
-            RawBsonDocument baselineDocument = new RawBsonDocument(payload, 0, baselineLength);
-            FtdcBaselineFlattener.FlattenedBaseline flattened = flattener.flatten(baselineDocument);
             int numAttributes = littleEndianInt(payload, baselineLength);
             int numDeltas = littleEndianInt(payload, baselineLength + 4);
-            if (numAttributes < 1 || numAttributes != flattened.values().length) {
+            validateScale(numAttributes, numDeltas, location);
+            RawBsonDocument baselineDocument = new RawBsonDocument(payload, 0, baselineLength);
+            FtdcBaselineFlattener.FlattenedBaseline flattened = flattener.flatten(baselineDocument);
+            if (numAttributes != flattened.values().length) {
                 throw new FtdcFormatException(location + "属性数量不一致，声明 " + numAttributes
                         + "，baseline 得到 " + flattened.values().length);
-            }
-            if (numDeltas < 0 || numDeltas > 10_000_000) {
-                throw new FtdcFormatException(location + "delta 数量非法：" + numDeltas);
             }
 
             int[] offsets = new int[numAttributes];
@@ -59,6 +57,11 @@ public final class FtdcBlockScanner {
                         delta = varInts.read(payload, cursor);
                         if (delta == 0) {
                             zerosLeft = varInts.read(payload, cursor);
+                            long processed = (long) attribute * numDeltas + point + 1;
+                            long remaining = (long) numAttributes * numDeltas - processed;
+                            if (zerosLeft > remaining) {
+                                throw new FtdcFormatException(location + "零游程超出声明的属性数据");
+                            }
                         }
                     }
                     lastValues[attribute] += delta;
@@ -88,33 +91,67 @@ public final class FtdcBlockScanner {
     }
 
     public byte[] decompress(byte[] data, String location) {
-        if (data == null || data.length < 6) {
+        if (data == null || data.length < 12) {
             throw new FtdcFormatException(location + "压缩 data 过短");
         }
         int declared = littleEndianInt(data, 0);
         if (declared < 5 || declared > MAX_UNCOMPRESSED_BLOCK_BYTES) {
             throw new FtdcFormatException(location + "声明解压长度非法：" + declared);
         }
-        try (InflaterInputStream inflater = new InflaterInputStream(new ByteArrayInputStream(data, 4, data.length - 4));
-             ByteArrayOutputStream output = new ByteArrayOutputStream(Math.min(declared, 1024 * 1024))) {
-            byte[] buffer = new byte[8192];
+        Inflater inflater = new Inflater();
+        try {
+            inflater.setInput(data, 4, data.length - 4);
+            byte[] output = new byte[declared];
+            byte[] overflow = new byte[1];
             int total = 0;
-            int read;
-            while ((read = inflater.read(buffer)) >= 0) {
-                total += read;
-                if (total > declared) {
+            while (!inflater.finished()) {
+                int read;
+                if (total < declared) {
+                    read = inflater.inflate(output, total, declared - total);
+                    total += read;
+                } else {
+                    read = inflater.inflate(overflow);
+                    if (read > 0) {
+                        throw new FtdcFormatException(location + "实际解压长度超过声明值");
+                    }
+                }
+                if (read == 0 && !inflater.finished()) {
+                    if (inflater.needsDictionary()) {
+                        throw new FtdcFormatException(location + "zlib 数据需要外部字典");
+                    }
+                    if (inflater.needsInput()) {
+                        throw new FtdcFormatException(location + "zlib 压缩数据截断");
+                    }
                     throw new FtdcFormatException(location + "实际解压长度超过声明值");
                 }
-                output.write(buffer, 0, read);
             }
             if (total != declared) {
                 throw new FtdcFormatException(location + "实际解压长度 " + total + " 与声明值 " + declared + " 不符");
             }
-            return output.toByteArray();
+            if (inflater.getRemaining() != 0) {
+                throw new FtdcFormatException(location + "zlib 流后存在剩余压缩数据");
+            }
+            return output;
         } catch (FtdcFormatException e) {
             throw e;
-        } catch (IOException e) {
+        } catch (DataFormatException e) {
             throw new FtdcFormatException(location + "zlib 解压失败", e);
+        } finally {
+            inflater.end();
+        }
+    }
+
+    public static void validateScale(int numAttributes, int numDeltas, String location) {
+        if (numAttributes < 1) {
+            throw new FtdcFormatException(location + "属性数量非法：" + numAttributes);
+        }
+        long sampleCount = (long) numDeltas + 1;
+        if (numDeltas < 0 || sampleCount > MAX_SAMPLES_PER_BLOCK) {
+            throw new FtdcFormatException(location + "样本数量非法：" + sampleCount);
+        }
+        if ((long) numAttributes * sampleCount > MAX_METRIC_SAMPLE_CELLS) {
+            throw new FtdcFormatException(location + "指标与样本乘积超过上限："
+                    + numAttributes + " × " + sampleCount);
         }
     }
 

@@ -65,12 +65,19 @@ class FtdcSeriesServiceTest {
 
         FtdcSeriesResult raw = service.series(task.id(), metricId,
                 new FtdcSeriesQuery(null, null, 2, FtdcSeriesQuery.View.RAW));
-        assertThat(raw.timestamps()).containsExactly(1_700_000_001_000L, 1_700_000_003_000L);
-        assertThat(raw.values()).containsExactly(12L, 9L);
+        assertThat(raw.timestamps()).containsExactly(1_700_000_000_000L, 1_700_000_003_000L);
+        assertThat(raw.values()).containsExactly(10L, 9L);
+        assertThat(raw.min()).isEqualTo(9L);
+        assertThat(raw.max()).isEqualTo(12L);
+        assertThat(raw.average()).isEqualTo(10.75);
+        assertThat(raw.allZero()).isFalse();
 
         FtdcSeriesResult delta = service.series(task.id(), metricId,
                 new FtdcSeriesQuery(null, null, 2, FtdcSeriesQuery.View.DELTA));
         assertThat(delta.values()).containsExactly(null, -3L);
+        assertThat(delta.min()).isEqualTo(-3L);
+        assertThat(delta.max()).isEqualTo(2L);
+        assertThat(delta.average()).isEqualTo(-1.0 / 3.0);
     }
 
     @Test
@@ -85,8 +92,70 @@ class FtdcSeriesServiceTest {
         assertThat(result.name()).isEqualTo("server/network");
         assertThat(result.series()).extracting(FtdcSeriesResult::path)
                 .containsExactly("server/network/in", "server/network/out");
-        assertThat(result.series().get(0).values()).containsExactly(110L, 130L);
-        assertThat(result.series().get(1).values()).containsExactly(220L, 260L);
+        assertThat(result.series().get(0).values()).containsExactly(100L, 130L);
+        assertThat(result.series().get(1).values()).containsExactly(200L, 260L);
+    }
+
+    @Test
+    void preservesFirstLastSpikeAndValleyAndComputesStatisticsFromEveryPoint() {
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        FileFtdcTaskRepository extremaRepository = new FileFtdcTaskRepository(directory.resolve("extrema"), mapper);
+        FtdcOperationGate extremaGate = new FtdcOperationGate();
+        FtdcTaskRunner runner = new FtdcTaskRunner(extremaRepository, extremaGate, mapper);
+        FtdcTaskService tasks = new FtdcTaskService(extremaRepository, runner, Runnable::run);
+        byte[] content = FtdcFixtureBuilder.file(FtdcFixtureBuilder.metadata(), FtdcFixtureBuilder.block(
+                new BsonDocument("start", new BsonDateTime(1_000L)).append("signal", new BsonInt64(10)),
+                List.of(
+                        new long[]{1_000L, 2_000L, 3_000L, 4_000L, 5_000L},
+                        new long[]{10, 11, 999, -500, 12}
+                )));
+        FtdcTask extremaTask = tasks.create("extrema", List.of(
+                new MockMultipartFile("files", "metrics.extrema", null, content)));
+        FtdcSeriesService extremaService = new FtdcSeriesService(extremaRepository, extremaGate);
+        FtdcMetricGroups.Group group = extremaService.groups(extremaTask.id()).stream()
+                .filter(item -> item.name().equals("signal")).findFirst().orElseThrow();
+
+        FtdcSeriesResult result = extremaService.groupSeries(extremaTask.id(), group.groupId(),
+                new FtdcSeriesQuery(null, null, 4, FtdcSeriesQuery.View.RAW)).series().get(0);
+
+        assertThat(result.timestamps()).containsExactly(1_000L, 3_000L, 4_000L, 5_000L);
+        assertThat(result.values()).containsExactly(10L, 999L, -500L, 12L);
+        assertThat(result.min()).isEqualTo(-500L);
+        assertThat(result.max()).isEqualTo(999L);
+        assertThat(result.average()).isEqualTo(106.4);
+        assertThat(result.allZero()).isFalse();
+    }
+
+    @Test
+    void preservesRealTimeGapAsNullWhileDownsamplingExtrema() {
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        FileFtdcTaskRepository gapRepository = new FileFtdcTaskRepository(directory.resolve("gap"), mapper);
+        FtdcOperationGate gapGate = new FtdcOperationGate();
+        FtdcTaskRunner runner = new FtdcTaskRunner(gapRepository, gapGate, mapper);
+        FtdcTaskService tasks = new FtdcTaskService(gapRepository, runner, Runnable::run);
+        long[] timestamps = {
+                1_000L, 1_950L, 3_000L, 4_050L, 12_000L, 13_020L,
+                14_000L, 30_000L, 31_050L, 32_000L, 33_020L, 34_000L
+        };
+        long[] values = {10, 11, 12, 900, 13, 14, 15, -700, 16, 17, 18, 19};
+        byte[] content = FtdcFixtureBuilder.file(FtdcFixtureBuilder.metadata(), FtdcFixtureBuilder.block(
+                new BsonDocument("start", new BsonDateTime(timestamps[0])).append("signal", new BsonInt64(values[0])),
+                List.of(timestamps, values)));
+        FtdcTask gapTask = tasks.create("gap", List.of(
+                new MockMultipartFile("files", "metrics.gap", null, content)));
+        FtdcSeriesService gapService = new FtdcSeriesService(gapRepository, gapGate);
+        FtdcMetricGroups.Group group = gapService.groups(gapTask.id()).stream()
+                .filter(item -> item.name().equals("signal")).findFirst().orElseThrow();
+
+        FtdcSeriesResult result = gapService.groupSeries(gapTask.id(), group.groupId(),
+                new FtdcSeriesQuery(null, null, 6, FtdcSeriesQuery.View.RAW)).series().get(0);
+
+        assertThat(result.timestamps()).hasSameSizeAs(result.values()).hasSizeLessThanOrEqualTo(6);
+        assertThat(result.timestamps().get(0)).isEqualTo(1_000L);
+        assertThat(result.timestamps().get(result.timestamps().size() - 1)).isEqualTo(34_000L);
+        assertThat(result.values()).contains(900L, -700L);
+        assertThat(result.values().stream().filter(java.util.Objects::isNull)).hasSize(2);
+        assertThat(result.timestamps().get(result.values().indexOf(null))).isBetween(4_051L, 11_999L);
     }
 
     @Test

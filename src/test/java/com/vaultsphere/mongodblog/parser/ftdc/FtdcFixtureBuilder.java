@@ -53,6 +53,25 @@ public final class FtdcFixtureBuilder {
             throw new IllegalStateException(impossible);
         }
         byte[] payload = uncompressed.toByteArray();
+        return new BsonDocument("type", new BsonInt32(1))
+                .append("data", new BsonBinary(compress(payload)));
+    }
+
+    public static byte[] compressedBlockData(BsonDocument baseline, int metricCount, int deltaCount,
+                                             byte[] encodedDeltas) {
+        ByteArrayOutputStream uncompressed = new ByteArrayOutputStream();
+        try {
+            uncompressed.write(encode(baseline));
+            uncompressed.write(leInt(metricCount));
+            uncompressed.write(leInt(deltaCount));
+            uncompressed.write(encodedDeltas);
+        } catch (IOException impossible) {
+            throw new IllegalStateException(impossible);
+        }
+        return compress(uncompressed.toByteArray());
+    }
+
+    public static byte[] compress(byte[] payload) {
         ByteArrayOutputStream compressed = new ByteArrayOutputStream();
         try {
             compressed.write(leInt(payload.length));
@@ -62,8 +81,7 @@ public final class FtdcFixtureBuilder {
         } catch (IOException impossible) {
             throw new IllegalStateException(impossible);
         }
-        return new BsonDocument("type", new BsonInt32(1))
-                .append("data", new BsonBinary(compressed.toByteArray()));
+        return compressed.toByteArray();
     }
 
     private static void writeDeltas(ByteArrayOutputStream output, List<long[]> values, int pointCount) {

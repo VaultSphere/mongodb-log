@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.Set;
 import java.io.OutputStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -85,6 +86,28 @@ class FtdcRealSampleAcceptanceTest {
         assertThat(networkSeries.series()).extracting(FtdcSeriesResult::path)
                 .contains("serverStatus/network/bytesIn", "serverStatus/network/bytesOut");
         assertThat(networkSeries.series()).allSatisfy(item -> assertThat(item.values()).hasSizeLessThanOrEqualTo(1_200));
+
+        Set<String> coreNames = Set.of(
+                "connections", "network", "opcounters", "mem",
+                "globalLock/currentQueue", "globalLock/activeClients",
+                "metrics/document", "metrics/queryExecutor", "metrics/cursor", "metrics/operation",
+                "wiredTiger/cache/bytes", "wiredTiger/cache/pages", "wiredTiger/cache/eviction",
+                "wiredTiger/transaction/rollback");
+        List<FtdcMetricGroups.Group> coreGroups = series.groups(id).stream()
+                .filter(group -> coreNames.contains(group.name())
+                        || group.name().startsWith("systemMetrics/cpu")
+                        || group.name().startsWith("systemMetrics/memory")
+                        || group.name().startsWith("systemMetrics/disks/"))
+                .toList();
+        assertThat(coreGroups).hasSize(19);
+        for (FtdcMetricGroups.Group coreGroup : coreGroups) {
+            FtdcGroupSeriesResult result = series.groupSeries(id, coreGroup.groupId(),
+                    new FtdcSeriesQuery(null, null, 1_200, FtdcSeriesQuery.View.RAW));
+            assertThat(result.series()).allSatisfy(item -> {
+                assertThat(item.timestamps()).hasSameSizeAs(item.values());
+                assertThat(item.values()).hasSizeLessThanOrEqualTo(1_200);
+            });
+        }
     }
 
     @Test

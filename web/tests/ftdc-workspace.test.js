@@ -160,19 +160,69 @@ describe('FTDC workspace', () => {
     wrapper.unmount()
   })
 
-  it('inserts a null point at a time gap and formats it as a dash', () => {
+  it('shows a failed group in place and continues with the remaining groups', async () => {
+    const task = { id: 'task', name: 'FTDC', status: 'COMPLETED', files: [], totalBytes: 1, blockCount: 1, metricCount: 3, sampleCount: 2 }
+    const requestedGroups = []
+    vi.stubGlobal('fetch', vi.fn(url => {
+      if (url === '/api/ftdc-tasks') return Promise.resolve(reply([task]))
+      if (url.endsWith('/groups')) return Promise.resolve(reply([
+        { groupId: 'first', name: 'first', metricCount: 1 },
+        { groupId: 'broken', name: 'broken', metricCount: 1 },
+        { groupId: 'last', name: 'last', metricCount: 1 },
+      ]))
+      const match = url.match(/\/groups\/([^/]+)\/series/)
+      if (match) requestedGroups.push(match[1])
+      if (url.includes('/groups/broken/series')) {
+        return Promise.resolve({ ok: false, status: 422, text: async () => JSON.stringify({ message: 'FTDC block 损坏' }) })
+      }
+      if (match) return Promise.resolve(reply({ groupId: match[1], name: match[1], series: [{ metricId: match[1], path: match[1], timestamps: [1000], values: [1] }] }))
+      throw new Error(`unexpected ${url}`)
+    }))
+    const groupChart = { props: ['group'], template: '<div class="group-result">{{ group.name }}</div>' }
+    const wrapper = mount(FtdcWorkspace, { global: { plugins: [ElementPlus], stubs: { FtdcMetricGroupChart: groupChart } } })
+    await flushPromises()
+    await wrapper.findAll('.ftdc-task-list button').find(button => button.text() === '查看指标').trigger('click')
+    await flushPromises()
+    wrapper.vm.selectedGroupIds = ['first', 'broken', 'last']
+
+    await wrapper.vm.querySelectedGroups()
+    await flushPromises()
+
+    expect(requestedGroups).toEqual(['first', 'broken', 'last'])
+    expect(wrapper.findAll('.group-result').map(item => item.text())).toEqual(['first', 'last'])
+    expect(wrapper.find('.group-error-card').text()).toContain('broken')
+    expect(wrapper.find('.group-error-card').text()).toContain('Metric block 损坏')
+    expect(wrapper.text()).toContain('1 个指标组加载失败')
+    wrapper.unmount()
+  })
+
+  it('renders a backend time-gap marker as a dash', () => {
     const chartStub = { name: 'AnalysisChart', props: ['option'], template: '<div class="chart-stub" />' }
     const wrapper = mount(FtdcMetricGroupChart, {
       props: { group: { groupId: 'g', name: 'server', series: [
-        { metricId: 'a', path: 'server/a', timestamps: [1000, 2000, 10000], values: [1, 2, 3] },
+        { metricId: 'a', path: 'server/a', timestamps: [1000, 3000, 10000], values: [1, null, 3] },
       ] } },
       global: { stubs: { AnalysisChart: chartStub } },
     })
 
     const option = wrapper.findComponent({ name: 'AnalysisChart' }).props('option')
-    expect(option.series[0].data).toEqual([[1000, 1], [2000, 2], [3000, null], [10000, 3]])
+    expect(option.series[0].data).toEqual([[1000, 1], [3000, null], [10000, 3]])
     expect(option.series[0].connectNulls).toBe(false)
     expect(option.tooltip.valueFormatter([3000, null])).toBe('-')
+    wrapper.unmount()
+  })
+
+  it('does not infer false gaps from irregular extrema timestamps after downsampling', () => {
+    const chartStub = { name: 'AnalysisChart', props: ['option'], template: '<div class="chart-stub" />' }
+    const wrapper = mount(FtdcMetricGroupChart, {
+      props: { group: { groupId: 'g', name: 'server', series: [
+        { metricId: 'a', path: 'server/a', timestamps: [1000, 1950, 3000, 12000, 13020, 30000], values: [1, 2, 3, 4, 5, 6] },
+      ] } },
+      global: { stubs: { AnalysisChart: chartStub } },
+    })
+
+    const points = wrapper.findComponent({ name: 'AnalysisChart' }).props('option').series[0].data
+    expect(points).toEqual([[1000, 1], [1950, 2], [3000, 3], [12000, 4], [13020, 5], [30000, 6]])
     wrapper.unmount()
   })
 })

@@ -12,7 +12,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 public final class FtdcFileReader {
-    static final int MAX_DOCUMENT_BYTES = 128 * 1024 * 1024;
+    public static final int MAX_DOCUMENT_BYTES = 16 * 1024 * 1024;
 
     public ScanSummary scan(Path path, DocumentConsumer consumer) throws IOException {
         int documents = 0;

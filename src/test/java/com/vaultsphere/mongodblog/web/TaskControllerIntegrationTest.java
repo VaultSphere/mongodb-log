@@ -79,7 +79,28 @@ class TaskControllerIntegrationTest {
                 .andReturn();
         String markdown = report.getResponse().getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
         assertThat(markdown)
-                .contains("# MongoDB 日志分析报告", "## 数据可信度", "## 慢查询分析", "{\"amount\"")
+                .contains(
+                        "# MongoDB 日志分析报告",
+                        "## 慢查询分析",
+                        "### 解析与总体统计",
+                        "### 客户端统计 · Top 20",
+                        "客户端 1（IP 已脱敏）",
+                        "### 操作类型统计",
+                        "### 集合统计 · Top 20",
+                        "### Namespace 响应量",
+                        "### 执行计划分布",
+                        "### CPU 耗时",
+                        "find\\|sales.orders",
+                        "### CPU 耗时比例分布",
+                        "### 每小时平均连接数",
+                        "### 查询模式 Top 50",
+                        "### 最慢查询明细 · Top 5000",
+                        "## 运行诊断",
+                        "### 运行诊断概览",
+                        "### 数据可信度",
+                        "### 异常事件时间线",
+                        "### Query Framework 分布",
+                        "{\"amount\"")
                 .doesNotContain("10.0.0.8", "OPEN", "41712");
 
         mockMvc.perform(get("/api/tasks/{id}/slow-queries", taskId).param("page", "1").param("size", "20"))

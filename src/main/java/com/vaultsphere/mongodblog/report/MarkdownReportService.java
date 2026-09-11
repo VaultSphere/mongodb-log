@@ -1,8 +1,10 @@
 package com.vaultsphere.mongodblog.report;
 
 import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
+import com.vaultsphere.mongodblog.analysis.AggregateStat;
 import com.vaultsphere.mongodblog.analysis.DurationBucketStat;
 import com.vaultsphere.mongodblog.analysis.PatternStat;
+import com.vaultsphere.mongodblog.analysis.SlowQueryRecord;
 import com.vaultsphere.mongodblog.analysis.diagnostics.LogDiagnostics;
 import com.vaultsphere.mongodblog.storage.TaskRepository;
 import com.vaultsphere.mongodblog.task.AnalysisTask;
@@ -10,6 +12,8 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.regex.Pattern;
@@ -32,7 +36,9 @@ public class MarkdownReportService {
                 .orElseThrow(() -> new NoSuchElementException("任务不存在：" + taskId));
         AnalysisSummary summary = repository.readSummary(taskId);
         LogDiagnostics diagnostics = repository.readDiagnostics(taskId).orElse(null);
-        StringBuilder report = new StringBuilder(16_384);
+        List<SlowQueryRecord> retainedSlowQueries = repository.readSlowQueries(taskId);
+        RemoteAliases remoteAliases = new RemoteAliases();
+        StringBuilder report = new StringBuilder(65_536);
         line(report, "# MongoDB 日志分析报告");
         line(report, "");
         line(report, "> 本报告由本地离线工具生成，适合交给 AI 进行二次分析。报告不包含完整原始日志、命令字面值、用户名或完整客户端 IP。");
@@ -48,18 +54,15 @@ public class MarkdownReportService {
         item(report, "解析结果", "成功 " + summary.successLines() + "，部分解析 " + summary.partialLines()
                 + "，失败 " + summary.failedLines() + "，跳过 " + summary.skippedLines());
 
-        appendQuality(report, diagnostics);
-        appendEvents(report, diagnostics);
-        appendConnections(report, diagnostics);
-        appendReplication(report, diagnostics);
-        appendSlowQueries(report, summary, diagnostics);
+        appendSlowQueries(report, summary, retainedSlowQueries, remoteAliases);
+        appendDiagnostics(report, diagnostics);
         appendLimits(report, diagnostics);
         return new Report(fileName(task.name()), report.toString());
     }
 
     private void appendQuality(StringBuilder report, LogDiagnostics diagnostics) {
         line(report, "");
-        line(report, "## 数据可信度");
+        line(report, "### 数据可信度");
         line(report, "");
         if (diagnostics == null) {
             line(report, "此历史任务未生成运行诊断；重新上传原日志后可获得字段覆盖、截断和事件分析。");
@@ -86,7 +89,7 @@ public class MarkdownReportService {
 
     private void appendEvents(StringBuilder report, LogDiagnostics diagnostics) {
         line(report, "");
-        line(report, "## 异常事件");
+        line(report, "### 异常事件汇总");
         line(report, "");
         if (diagnostics == null) {
             line(report, "运行诊断不可用。");
@@ -111,7 +114,7 @@ public class MarkdownReportService {
 
     private void appendConnections(StringBuilder report, LogDiagnostics diagnostics) {
         line(report, "");
-        line(report, "## 连接与客户端");
+        line(report, "### 连接与客户端");
         line(report, "");
         if (diagnostics == null) {
             line(report, "运行诊断不可用。");
@@ -133,7 +136,7 @@ public class MarkdownReportService {
 
     private void appendReplication(StringBuilder report, LogDiagnostics diagnostics) {
         line(report, "");
-        line(report, "## 复制集与网络时间线");
+        line(report, "### 复制集与网络");
         line(report, "");
         if (diagnostics == null || diagnostics.replicationEvents().isEmpty()) {
             line(report, diagnostics == null ? "运行诊断不可用。" : "未识别到相关事件。");
@@ -148,55 +151,136 @@ public class MarkdownReportService {
                         + time(event.lastEpochMillis()) + " |"));
     }
 
-    private void appendSlowQueries(StringBuilder report, AnalysisSummary summary, LogDiagnostics diagnostics) {
+    private void appendSlowQueries(StringBuilder report, AnalysisSummary summary,
+                                   List<SlowQueryRecord> retainedSlowQueries, RemoteAliases remoteAliases) {
         line(report, "");
         line(report, "## 慢查询分析");
         line(report, "");
+        line(report, "### 解析与总体统计");
+        line(report, "");
+        item(report, "日志总行数", Long.toString(summary.totalLines()));
+        item(report, "成功／部分解析／失败／跳过", summary.successLines() + "／" + summary.partialLines()
+                + "／" + summary.failedLines() + "／" + summary.skippedLines());
         item(report, "慢查询总数", Long.toString(summary.slowQueryCount()));
         item(report, "慢查询总耗时", summary.totalSlowDurationMillis() + " ms");
+        item(report, "HeartBeat Failed", Long.toString(summary.heartbeatFailures()));
+        item(report, "CPU 数据", summary.cpuAvailable() ? "日志已提供 cpuNanos" : "日志未提供 cpuNanos");
+        if (summary.parseErrors() != null && !summary.parseErrors().isEmpty()) {
+            line(report, "");
+            line(report, "#### 解析异常分类");
+            line(report, "");
+            line(report, "| 分类 | 行数 |");
+            line(report, "|---|---:|");
+            summary.parseErrors().forEach((reason, count) -> line(report, "| " + cell(reason) + " | " + count + " |"));
+        }
         if (summary.durationDistribution() != null && !summary.durationDistribution().isEmpty()) {
             line(report, "");
             line(report, "### 耗时分布");
             line(report, "");
-            line(report, "| 区间 | 数量 | 占比 | 平均耗时 |");
-            line(report, "|---|---:|---:|---:|");
+            line(report, "| 区间 | 数量 | 占比 | 总耗时 | 平均耗时 | 最大耗时 |");
+            line(report, "|---|---:|---:|---:|---:|---:|");
             for (DurationBucketStat bucket : summary.durationDistribution()) {
                 line(report, "| " + cell(bucket.label()) + " | " + bucket.count() + " | "
-                        + decimal(bucket.percentage()) + "% | " + decimal(bucket.averageDurationMillis()) + " ms |");
+                        + decimal(bucket.percentage()) + "% | " + bucket.totalDurationMillis() + " ms | "
+                        + decimal(bucket.averageDurationMillis()) + " ms | " + bucket.maxDurationMillis() + " ms |");
             }
         }
-        if (diagnostics != null) {
-            var slow = diagnostics.slowQueries();
-            line(report, "");
-            line(report, "### 效率线索");
-            line(report, "");
-            item(report, "COLLSCAN", Long.toString(slow.collscanCount()));
-            item(report, "扫描文档／返回比不低于 100", Long.toString(slow.highDocumentScanRatioCount()));
-            item(report, "扫描索引键／返回比不低于 100", Long.toString(slow.highIndexScanRatioCount()));
-            item(report, "磁盘读取耗时占比不低于 50％", Long.toString(slow.storageDominantCount()));
-            item(report, "查询规划耗时占比不低于 50％", Long.toString(slow.planningDominantCount()));
-            item(report, "写关注／Flow Control／锁等待", slow.writeConcernWaitCount() + "／"
-                    + slow.flowControlWaitCount() + "／" + slow.lockWaitCount());
-            item(report, "分片响应／鉴权缓存／执行队列／Oplog 提交等待", slow.remoteOpWaitCount() + "／"
-                    + slow.authorizationWaitCount() + "／" + slow.queueWaitCount() + "／" + slow.oplogSlotWaitCount());
-            item(report, "额外排序／使用临时磁盘", slow.hasSortStageCount() + "／" + slow.usedDiskCount());
-            item(report, "查询执行落盘", Long.toString(slow.spillCount()));
-            item(report, "不同查询形状", Long.toString(slow.distinctShapeCount()));
-            if (!slow.insights().isEmpty()) {
-                line(report, "");
-                line(report, "### 重点慢查询线索");
-                line(report, "");
-                line(report, "| 集合 | 操作 | 耗时 | 计划 | 文档／返回 | 索引键／返回 | 线索 | 规范化查询模式 |");
-                line(report, "|---|---|---:|---|---:|---:|---|---|");
-                slow.insights().forEach(insight -> line(report,
-                        "| " + cell(insight.namespace()) + " | " + cell(insight.operation()) + " | "
-                                + insight.durationMillis() + " ms | " + cell(insight.planSummary()) + " | "
-                                + decimal(insight.documentsPerReturned()) + " | " + decimal(insight.keysPerReturned())
-                                + " | " + cell(String.join("、", insight.reasons())) + " | "
-                                + cell(insight.queryPattern()) + " |"));
-            }
-        }
+
+        appendAggregateTable(report, "客户端统计 · Top 20", "客户端", summary.remotes(), remoteAliases);
+        appendAggregateTable(report, "操作类型统计", "操作类型", summary.operations(), null);
+        appendAggregateTable(report, "集合统计 · Top 20", "Namespace", summary.namespaces(), null);
+        appendNamespaceResponses(report, summary.namespaceResponseBytes());
+        appendAggregateTable(report, "执行计划分布", "执行计划", summary.plans(), null);
+        appendCpu(report, summary);
+        appendConnectionAverages(report, summary);
         appendPatterns(report, summary);
+        appendRetainedSlowQueries(report, retainedSlowQueries, remoteAliases);
+    }
+
+    private void appendAggregateTable(StringBuilder report, String title, String keyLabel,
+                                      Map<String, AggregateStat> values, RemoteAliases remoteAliases) {
+        line(report, "");
+        line(report, "### " + title);
+        line(report, "");
+        if (values == null || values.isEmpty()) {
+            line(report, "日志未提供相关数据。");
+            return;
+        }
+        line(report, "| " + keyLabel + " | 次数 | 总耗时 | 平均耗时 | 最小耗时 | 最大耗时 | 响应字节 | CPU 纳秒 |");
+        line(report, "|---|---:|---:|---:|---:|---:|---:|---:|");
+        values.forEach((key, stat) -> line(report, "| "
+                + cell(remoteAliases == null ? key : remoteAliases.alias(key)) + " | " + stat.count() + " | "
+                + stat.totalDurationMillis() + " | " + decimal(stat.averageDurationMillis()) + " | "
+                + stat.minDurationMillis() + " | " + stat.maxDurationMillis() + " | "
+                + stat.totalResponseBytes() + " | " + stat.totalCpuNanos() + " |"));
+    }
+
+    private void appendNamespaceResponses(StringBuilder report, Map<String, Long> responses) {
+        line(report, "");
+        line(report, "### Namespace 响应量");
+        line(report, "");
+        if (responses == null || responses.isEmpty()) {
+            line(report, "日志未提供相关数据。");
+            return;
+        }
+        line(report, "| Namespace | 响应字节 |");
+        line(report, "|---|---:|");
+        responses.forEach((namespace, bytes) -> line(report, "| " + cell(namespace) + " | " + bytes + " |"));
+    }
+
+    private void appendCpu(StringBuilder report, AnalysisSummary summary) {
+        line(report, "");
+        line(report, "### CPU 耗时");
+        line(report, "");
+        if (!summary.cpuAvailable()) {
+            line(report, "日志未提供 cpuNanos。");
+        } else {
+            appendAggregateRows(report, "操作类型|Namespace", summary.cpuByOperationNamespace());
+        }
+        line(report, "");
+        line(report, "### CPU 耗时比例分布");
+        line(report, "");
+        if (summary.cpuByOperationBuckets() == null) {
+            line(report, "此历史任务未保存 CPU 区间统计。");
+            return;
+        }
+        line(report, "| 操作类型 | CPU 比例区间 | 次数 |");
+        line(report, "|---|---|---:|");
+        summary.cpuByOperationBuckets().forEach((operation, buckets) -> {
+            if (buckets.isEmpty()) {
+                line(report, "| " + cell(operation) + " | 无样本 | 0 |");
+            } else {
+                buckets.forEach((bucket, count) -> line(report,
+                        "| " + cell(operation) + " | " + cpuBucket(bucket) + " | " + count + " |"));
+            }
+        });
+    }
+
+    private void appendAggregateRows(StringBuilder report, String keyLabel, Map<String, AggregateStat> values) {
+        if (values == null || values.isEmpty()) {
+            line(report, "日志未提供相关数据。");
+            return;
+        }
+        line(report, "| " + keyLabel + " | 次数 | 总耗时 | 平均耗时 | 最小耗时 | 最大耗时 | 响应字节 | CPU 纳秒 |");
+        line(report, "|---|---:|---:|---:|---:|---:|---:|---:|");
+        values.forEach((key, stat) -> line(report, "| " + cell(key) + " | " + stat.count() + " | "
+                + stat.totalDurationMillis() + " | " + decimal(stat.averageDurationMillis()) + " | "
+                + stat.minDurationMillis() + " | " + stat.maxDurationMillis() + " | "
+                + stat.totalResponseBytes() + " | " + stat.totalCpuNanos() + " |"));
+    }
+
+    private void appendConnectionAverages(StringBuilder report, AnalysisSummary summary) {
+        line(report, "");
+        line(report, "### 每小时平均连接数");
+        line(report, "");
+        if (summary.averageConnections() == null || summary.averageConnections().isEmpty()) {
+            line(report, "日志未提供可解析的连接数事件。");
+            return;
+        }
+        line(report, "| UTC 小时 | 样本数 | 平均连接数 |");
+        line(report, "|---|---:|---:|");
+        summary.averageConnections().forEach(sample -> line(report, "| " + time(sample.timestampEpochMillis())
+                + " | " + sample.sampleCount() + " | " + decimal(sample.averageConnections()) + " |"));
     }
 
     private void appendPatterns(StringBuilder report, AnalysisSummary summary) {
@@ -204,14 +288,114 @@ public class MarkdownReportService {
         line(report, "");
         line(report, "### 查询模式 Top 50");
         line(report, "");
-        line(report, "| 集合 | 操作 | 次数 | 平均耗时 | 最大耗时 | 执行计划 | 规范化查询模式 |");
-        line(report, "|---|---|---:|---:|---:|---|---|");
+        line(report, "| 集合 | 操作 | 次数 | 总耗时 | 平均耗时 | 最小耗时 | 最大耗时 | CPU 纳秒 | 执行计划 | 最慢查询 ID | 规范化查询模式 |");
+        line(report, "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|");
         for (PatternStat pattern : summary.patternStats()) {
             line(report, "| " + cell(pattern.namespace()) + " | " + cell(pattern.operation()) + " | "
-                    + pattern.count() + " | " + decimal(pattern.averageDurationMillis()) + " ms | "
-                    + pattern.maxDurationMillis() + " ms | " + cell(pattern.planSummary()) + " | "
+                    + pattern.count() + " | " + pattern.totalDurationMillis() + " | "
+                    + decimal(pattern.averageDurationMillis()) + " | " + pattern.minDurationMillis() + " | "
+                    + pattern.maxDurationMillis() + " | " + (pattern.cpuAvailable() ? pattern.totalCpuNanos() : "-")
+                    + " | " + cell(pattern.planSummary()) + " | " + cell(pattern.slowestQueryId()) + " | "
                     + cell(pattern.pattern()) + " |");
         }
+    }
+
+    private void appendRetainedSlowQueries(StringBuilder report, List<SlowQueryRecord> slowQueries,
+                                           RemoteAliases remoteAliases) {
+        line(report, "");
+        line(report, "### 最慢查询明细 · Top 5000");
+        line(report, "");
+        if (slowQueries.isEmpty()) {
+            line(report, "没有保留的慢查询明细。");
+            return;
+        }
+        line(report, "| 查询 ID | 时间 | 文件序号 | 行号 | 客户端 | Namespace | 操作 | 耗时 ms | CPU ns | 响应字节 | 执行计划 | 规范化查询模式 |");
+        line(report, "|---|---|---:|---:|---|---|---|---:|---:|---:|---|---|");
+        slowQueries.forEach(query -> line(report, "| " + cell(query.queryId()) + " | "
+                + time(query.timestampEpochMillis()) + " | " + query.fileIndex() + " | " + query.lineNumber()
+                + " | " + cell(remoteAliases.alias(query.remote())) + " | " + cell(query.namespace()) + " | "
+                + cell(query.operation()) + " | " + query.durationMillis() + " | "
+                + (query.cpuNanos() == null ? "-" : query.cpuNanos()) + " | "
+                + (query.responseLength() == null ? "-" : query.responseLength()) + " | "
+                + cell(query.planSummary()) + " | " + cell(query.queryPattern()) + " |"));
+    }
+
+    private void appendDiagnostics(StringBuilder report, LogDiagnostics diagnostics) {
+        line(report, "");
+        line(report, "## 运行诊断");
+        line(report, "");
+        if (diagnostics == null) {
+            line(report, "此历史任务未生成运行诊断；重新上传原日志后可获得完整数据。");
+            return;
+        }
+        line(report, "### 运行诊断概览");
+        line(report, "");
+        item(report, "诊断 Schema 版本", Integer.toString(diagnostics.schemaVersion()));
+        item(report, "诊断已解析行数", Long.toString(diagnostics.totalParsedLines()));
+        item(report, "时间桶宽度", diagnostics.timelineBucketMillis() + " ms");
+        appendQuality(report, diagnostics);
+        appendEvents(report, diagnostics);
+        appendDiagnosticTimeline(report, diagnostics);
+        appendConnections(report, diagnostics);
+        appendReplication(report, diagnostics);
+        appendDiagnosticSlowQueries(report, diagnostics);
+    }
+
+    private void appendDiagnosticTimeline(StringBuilder report, LogDiagnostics diagnostics) {
+        line(report, "");
+        line(report, "### 异常事件时间线");
+        line(report, "");
+        if (diagnostics.timeline().isEmpty()) {
+            line(report, "没有可用时间桶。");
+            return;
+        }
+        line(report, "| 时间桶 | 警告 | 错误 | 致命错误 | 建立连接 | 结束连接 | 复制集事件 |");
+        line(report, "|---|---:|---:|---:|---:|---:|---:|");
+        diagnostics.timeline().forEach(bucket -> line(report, "| " + time(bucket.epochMillis()) + " | "
+                + bucket.warnings() + " | " + bucket.errors() + " | " + bucket.fatals() + " | "
+                + bucket.connectionsAccepted() + " | " + bucket.connectionsEnded() + " | "
+                + bucket.replicationEvents() + " |"));
+    }
+
+    private void appendDiagnosticSlowQueries(StringBuilder report, LogDiagnostics diagnostics) {
+        var slow = diagnostics.slowQueries();
+        line(report, "");
+        line(report, "### 慢查询效率线索");
+        line(report, "");
+        item(report, "诊断慢查询总数", Long.toString(slow.total()));
+        item(report, "COLLSCAN", Long.toString(slow.collscanCount()));
+        item(report, "扫描文档／返回比不低于 100", Long.toString(slow.highDocumentScanRatioCount()));
+        item(report, "扫描索引键／返回比不低于 100", Long.toString(slow.highIndexScanRatioCount()));
+        item(report, "零返回但扫描量高", Long.toString(slow.zeroReturnHighScanCount()));
+        item(report, "磁盘读取耗时占比不低于 50％", Long.toString(slow.storageDominantCount()));
+        item(report, "查询规划耗时占比不低于 50％", Long.toString(slow.planningDominantCount()));
+        item(report, "写关注／Flow Control／锁等待", slow.writeConcernWaitCount() + "／"
+                + slow.flowControlWaitCount() + "／" + slow.lockWaitCount());
+        item(report, "分片响应／鉴权缓存／执行队列／Oplog 提交等待", slow.remoteOpWaitCount() + "／"
+                + slow.authorizationWaitCount() + "／" + slow.queueWaitCount() + "／" + slow.oplogSlotWaitCount());
+        item(report, "额外排序／使用临时磁盘／执行落盘", slow.hasSortStageCount() + "／"
+                + slow.usedDiskCount() + "／" + slow.spillCount());
+        item(report, "不同查询形状", Long.toString(slow.distinctShapeCount()));
+        line(report, "");
+        line(report, "### Query Framework 分布");
+        line(report, "");
+        line(report, slow.queryFrameworks().isEmpty() ? "日志未提供 queryFramework。" : joinCounts(slow.queryFrameworks()));
+        if (slow.insights().isEmpty()) return;
+        line(report, "");
+        line(report, "### 重点慢查询诊断明细");
+        line(report, "");
+        line(report, "| 时间 | Namespace | 操作 | 耗时 ms | 计划 | Shape Hash | Plan Cache Key | 文档 | 索引键 | 返回 | 文档／返回 | 索引键／返回 | 磁盘读取 ms | 规划 ms | 写关注 ms | Flow Control ms | 锁等待 ms | 线索 | 规范化查询模式 |");
+        line(report, "|---|---|---|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|");
+        slow.insights().forEach(insight -> line(report, "| " + time(insight.timestampEpochMillis()) + " | "
+                + cell(insight.namespace()) + " | " + cell(insight.operation()) + " | " + insight.durationMillis()
+                + " | " + cell(insight.planSummary()) + " | " + cell(insight.shapeHash()) + " | "
+                + cell(insight.planCacheKey()) + " | " + nullable(insight.docsExamined()) + " | "
+                + nullable(insight.keysExamined()) + " | " + nullable(insight.returned()) + " | "
+                + decimal(insight.documentsPerReturned()) + " | " + decimal(insight.keysPerReturned()) + " | "
+                + decimal(insight.storageReadMillis()) + " | " + decimal(insight.planningMillis()) + " | "
+                + nullable(insight.writeConcernWaitMillis()) + " | " + decimal(insight.flowControlWaitMillis())
+                + " | " + decimal(insight.lockWaitMillis()) + " | "
+                + cell(String.join("、", insight.reasons())) + " | " + cell(insight.queryPattern()) + " |"));
     }
 
     private void appendLimits(StringBuilder report, LogDiagnostics diagnostics) {
@@ -251,6 +435,19 @@ public class MarkdownReportService {
                 .stripTrailingZeros().toPlainString();
     }
 
+    private String nullable(Number value) {
+        return value == null ? "-" : value.toString();
+    }
+
+    private String cpuBucket(String bucket) {
+        try {
+            long end = Long.parseLong(bucket);
+            return end == 0 ? "0％ ≤ CPU 比例 < 1％" : (end - 9) + "％ ≤ CPU 比例 < " + (end + 1) + "％";
+        } catch (NumberFormatException ignored) {
+            return cell(bucket);
+        }
+    }
+
     private String time(Long epochMillis) {
         return epochMillis == null ? "日志未提供" : Instant.ofEpochMilli(epochMillis).toString();
     }
@@ -272,5 +469,14 @@ public class MarkdownReportService {
     }
 
     public record Report(String fileName, String content) {
+    }
+
+    private static final class RemoteAliases {
+        private final Map<String, String> aliases = new LinkedHashMap<>();
+
+        private String alias(String remote) {
+            if (remote == null || remote.isBlank() || remote.equalsIgnoreCase("unknown")) return "unknown";
+            return aliases.computeIfAbsent(remote, ignored -> "客户端 " + (aliases.size() + 1) + "（IP 已脱敏）");
+        }
     }
 }

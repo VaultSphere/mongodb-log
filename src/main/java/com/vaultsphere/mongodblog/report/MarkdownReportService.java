@@ -21,9 +21,13 @@ import java.util.regex.Pattern;
 @Service
 public class MarkdownReportService {
     private static final Pattern IPV4 = Pattern.compile("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b");
+    private static final Pattern IPV6 = Pattern.compile(
+            "(?i)(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]{0,15}(?:%[a-z0-9_.-]+)?(?![0-9a-f:])");
     private static final Pattern MONGODB_URI = Pattern.compile("(?i)mongodb(?:\\+srv)?://\\S+");
     private static final Pattern EMAIL = Pattern.compile("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}");
     private static final Pattern SECRET = Pattern.compile("(?i)(password|passwd|token|secret)(\\s*[:=]\\s*)([^\\s,;]+)");
+    private static final Pattern USER_IDENTITY = Pattern.compile(
+            "(?i)\\b(user(?:name)?|principal)(\\s*[:=]\\s*)([^\\s,;]+)");
 
     private final TaskRepository repository;
 
@@ -45,9 +49,11 @@ public class MarkdownReportService {
         line(report, "");
         line(report, "## 任务概况");
         line(report, "");
-        item(report, "任务名称", redact(task.name()));
+        item(report, "任务名称", inline(task.name()));
+        item(report, "任务状态", task.status().name());
         item(report, "日志文件数", Integer.toString(task.files().size()));
         item(report, "文件总大小", Long.toString(task.totalBytes()) + " B");
+        appendFiles(report, task);
         item(report, "日志时间范围", time(summary.logStartEpochMillis()) + " ～ " + time(summary.logEndEpochMillis()));
         item(report, "日志总行数", Long.toString(summary.totalLines()));
         item(report, "慢查询数", Long.toString(summary.slowQueryCount()));
@@ -58,6 +64,17 @@ public class MarkdownReportService {
         appendDiagnostics(report, diagnostics);
         appendLimits(report, diagnostics);
         return new Report(fileName(task.name()), report.toString());
+    }
+
+    private void appendFiles(StringBuilder report, AnalysisTask task) {
+        line(report, "");
+        line(report, "### 日志文件");
+        line(report, "");
+        line(report, "| 文件名 | 大小 |");
+        line(report, "|---|---:|");
+        task.files().forEach(file -> line(report,
+                "| " + cell(file.originalName()) + " | " + file.sizeBytes() + " B |"));
+        line(report, "");
     }
 
     private void appendQuality(StringBuilder report, LogDiagnostics diagnostics) {
@@ -110,6 +127,15 @@ public class MarkdownReportService {
                         + (event.messageId() == null ? "-" : event.messageId()) + " | " + cell(redact(event.message()))
                         + " | " + event.count() + " | " + time(event.firstEpochMillis()) + " | "
                         + time(event.lastEpochMillis()) + " |"));
+        if (diagnostics.abnormalEvents().stream().noneMatch(event -> !event.samples().isEmpty())) return;
+        line(report, "");
+        line(report, "### 异常事件脱敏样本");
+        line(report, "");
+        line(report, "| 事件 ID | 时间 | 样本 |");
+        line(report, "|---:|---|---|");
+        diagnostics.abnormalEvents().forEach(event -> event.samples().forEach(sample -> line(report,
+                "| " + (event.messageId() == null ? "-" : event.messageId()) + " | "
+                        + time(sample.timestampEpochMillis()) + " | " + cell(sample.message()) + " |")));
     }
 
     private void appendConnections(StringBuilder report, LogDiagnostics diagnostics) {
@@ -124,13 +150,16 @@ public class MarkdownReportService {
         item(report, "建立／结束连接", connection.accepted() + "／" + connection.ended());
         item(report, "认证成功／未认证连接／重新认证警告", connection.authenticationSucceeded() + "／"
                 + connection.notAuthenticating() + "／" + connection.reauthenticationWarnings());
-        if (connection.connectionCountSamples() > 0) {
-            item(report, "打开连接数", "最小 " + connection.connectionCountMin() + "，最大 "
-                    + connection.connectionCountMax() + "，平均 " + decimal(connection.connectionCountAverage())
-                    + "，样本 " + connection.connectionCountSamples());
-        }
-        if (!connection.applications().isEmpty()) item(report, "客户端应用 Top", joinCounts(connection.applications()));
-        if (!connection.drivers().isEmpty()) item(report, "Driver Top", joinCounts(connection.drivers()));
+        item(report, "打开连接数", connection.connectionCountSamples() == 0
+                ? "日志未提供（样本 0）"
+                : "最小 " + nullable(connection.connectionCountMin()) + "，最大 "
+                        + nullable(connection.connectionCountMax()) + "，平均 "
+                        + decimal(connection.connectionCountAverage()) + "，样本 "
+                        + connection.connectionCountSamples());
+        item(report, "客户端应用 Top", connection.applications().isEmpty()
+                ? "日志未提供" : joinCounts(connection.applications()));
+        item(report, "Driver Top", connection.drivers().isEmpty()
+                ? "日志未提供" : joinCounts(connection.drivers()));
         if (connection.topValuesApproximate()) line(report, "\n客户端 Top 统计使用有界重频算法，显示值为近似计数。");
     }
 
@@ -142,10 +171,10 @@ public class MarkdownReportService {
             line(report, diagnostics == null ? "运行诊断不可用。" : "未识别到相关事件。");
             return;
         }
-        line(report, "| 类型 | 组件 | ID | 事件 | 次数 | 首次 | 最后 |");
-        line(report, "|---|---|---:|---|---:|---|---|");
+        line(report, "| 类型代码 | 类型 | 组件 | ID | 事件 | 次数 | 首次 | 最后 |");
+        line(report, "|---|---|---|---:|---|---:|---|---|");
         diagnostics.replicationEvents().forEach(event -> line(report,
-                "| " + cell(event.label()) + " | " + cell(event.component()) + " | "
+                "| " + cell(event.type()) + " | " + cell(event.label()) + " | " + cell(event.component()) + " | "
                         + (event.messageId() == null ? "-" : event.messageId()) + " | " + cell(redact(event.message()))
                         + " | " + event.count() + " | " + time(event.firstEpochMillis()) + " | "
                         + time(event.lastEpochMillis()) + " |"));
@@ -186,19 +215,44 @@ public class MarkdownReportService {
             }
         }
 
-        appendAggregateTable(report, "客户端统计 · Top 20", "客户端", summary.remotes(), remoteAliases);
-        appendAggregateTable(report, "操作类型统计", "操作类型", summary.operations(), null);
-        appendAggregateTable(report, "集合统计 · Top 20", "Namespace", summary.namespaces(), null);
+        boolean currentSummary = summary.patternStats() != null;
+        if (currentSummary) {
+            appendAggregateTable(report, "客户端统计 · Top 20", "客户端", summary.remotes(),
+                    remoteAliases, summary.cpuAvailable());
+        } else {
+            appendHistoricalSection(report, "客户端统计 · Top 20");
+        }
+        appendAggregateTable(report, "操作类型统计", "操作类型", summary.operations(), null, summary.cpuAvailable());
+        if (currentSummary) {
+            appendAggregateTable(report, "集合统计 · Top 20", "Namespace", summary.namespaces(),
+                    null, summary.cpuAvailable());
+        } else {
+            appendHistoricalSection(report, "集合统计 · Top 20");
+        }
         appendNamespaceResponses(report, summary.namespaceResponseBytes());
-        appendAggregateTable(report, "执行计划分布", "执行计划", summary.plans(), null);
+        if (currentSummary) {
+            appendAggregateTable(report, "执行计划分布", "执行计划", summary.plans(),
+                    null, summary.cpuAvailable());
+        } else {
+            appendHistoricalSection(report, "执行计划分布");
+        }
         appendCpu(report, summary);
         appendConnectionAverages(report, summary);
         appendPatterns(report, summary);
+        appendPatternSamples(report, summary.patternStats(), remoteAliases);
         appendRetainedSlowQueries(report, retainedSlowQueries, remoteAliases);
     }
 
+    private void appendHistoricalSection(StringBuilder report, String title) {
+        line(report, "");
+        line(report, "### " + title);
+        line(report, "");
+        line(report, "此历史任务未保存新版统计，请重新上传分析。");
+    }
+
     private void appendAggregateTable(StringBuilder report, String title, String keyLabel,
-                                      Map<String, AggregateStat> values, RemoteAliases remoteAliases) {
+                                      Map<String, AggregateStat> values, RemoteAliases remoteAliases,
+                                      boolean cpuAvailable) {
         line(report, "");
         line(report, "### " + title);
         line(report, "");
@@ -212,15 +266,20 @@ public class MarkdownReportService {
                 + cell(remoteAliases == null ? key : remoteAliases.alias(key)) + " | " + stat.count() + " | "
                 + stat.totalDurationMillis() + " | " + decimal(stat.averageDurationMillis()) + " | "
                 + stat.minDurationMillis() + " | " + stat.maxDurationMillis() + " | "
-                + stat.totalResponseBytes() + " | " + stat.totalCpuNanos() + " |"));
+                + stat.totalResponseBytes() + " | "
+                + (cpuAvailable ? stat.totalCpuNanos() : "日志未提供") + " |"));
     }
 
     private void appendNamespaceResponses(StringBuilder report, Map<String, Long> responses) {
         line(report, "");
         line(report, "### Namespace 响应量");
         line(report, "");
-        if (responses == null || responses.isEmpty()) {
-            line(report, "日志未提供相关数据。");
+        if (responses == null) {
+            line(report, "此历史任务未保存完整 Namespace 响应量，请重新上传分析。");
+            return;
+        }
+        if (responses.isEmpty()) {
+            line(report, "暂无响应数据量。");
             return;
         }
         line(report, "| Namespace | 响应字节 |");
@@ -240,8 +299,16 @@ public class MarkdownReportService {
         line(report, "");
         line(report, "### CPU 耗时比例分布");
         line(report, "");
+        if (!summary.cpuAvailable()) {
+            line(report, "日志未提供 cpuNanos。");
+            return;
+        }
         if (summary.cpuByOperationBuckets() == null) {
             line(report, "此历史任务未保存 CPU 区间统计。");
+            return;
+        }
+        if (summary.cpuByOperationBuckets().values().stream().allMatch(Map::isEmpty)) {
+            line(report, "暂无有效 CPU 比例样本。");
             return;
         }
         line(report, "| 操作类型 | CPU 比例区间 | 次数 |");
@@ -261,7 +328,7 @@ public class MarkdownReportService {
             line(report, "日志未提供相关数据。");
             return;
         }
-        line(report, "| " + keyLabel + " | 次数 | 总耗时 | 平均耗时 | 最小耗时 | 最大耗时 | 响应字节 | CPU 纳秒 |");
+        line(report, "| " + cell(keyLabel) + " | 次数 | 总耗时 | 平均耗时 | 最小耗时 | 最大耗时 | 响应字节 | CPU 纳秒 |");
         line(report, "|---|---:|---:|---:|---:|---:|---:|---:|");
         values.forEach((key, stat) -> line(report, "| " + cell(key) + " | " + stat.count() + " | "
                 + stat.totalDurationMillis() + " | " + decimal(stat.averageDurationMillis()) + " | "
@@ -284,10 +351,17 @@ public class MarkdownReportService {
     }
 
     private void appendPatterns(StringBuilder report, AnalysisSummary summary) {
-        if (summary.patternStats() == null || summary.patternStats().isEmpty()) return;
         line(report, "");
         line(report, "### 查询模式 Top 50");
         line(report, "");
+        if (summary.patternStats() == null) {
+            line(report, "此历史任务未保存新版统计，请重新上传分析。");
+            return;
+        }
+        if (summary.patternStats().isEmpty()) {
+            line(report, "暂无可识别的查询模式。");
+            return;
+        }
         line(report, "| 集合 | 操作 | 次数 | 总耗时 | 平均耗时 | 最小耗时 | 最大耗时 | CPU 纳秒 | 执行计划 | 最慢查询 ID | 规范化查询模式 |");
         line(report, "|---|---|---:|---:|---:|---:|---:|---:|---|---|---|");
         for (PatternStat pattern : summary.patternStats()) {
@@ -295,9 +369,28 @@ public class MarkdownReportService {
                     + pattern.count() + " | " + pattern.totalDurationMillis() + " | "
                     + decimal(pattern.averageDurationMillis()) + " | " + pattern.minDurationMillis() + " | "
                     + pattern.maxDurationMillis() + " | " + (pattern.cpuAvailable() ? pattern.totalCpuNanos() : "-")
-                    + " | " + cell(pattern.planSummary()) + " | " + cell(pattern.slowestQueryId()) + " | "
+                    + " | " + cell(pattern.planSummary()) + " | " + cell(slowestQueryId(pattern)) + " | "
                     + cell(pattern.pattern()) + " |");
         }
+    }
+
+    private String slowestQueryId(PatternStat pattern) {
+        if (pattern.slowestQueryId() != null) return pattern.slowestQueryId();
+        return pattern.slowestQuery() == null ? null : pattern.slowestQuery().queryId();
+    }
+
+    private void appendPatternSamples(StringBuilder report, List<PatternStat> patterns,
+                                      RemoteAliases remoteAliases) {
+        if (patterns == null || patterns.stream().noneMatch(pattern -> pattern.slowestQuery() != null)) return;
+        line(report, "");
+        line(report, "### 查询模式最慢样本 · Top 50");
+        line(report, "");
+        line(report, "每个查询模式独立保留的最慢样本，可能不在全局 Top 5000 中；原始日志与 attributes 不导出。");
+        line(report, "");
+        line(report, "| 查询 ID | 时间 | 文件序号 | 行号 | 客户端 | Namespace | 操作 | 耗时 ms | CPU ns | 响应字节 | 执行计划 | 规范化查询模式 |");
+        line(report, "|---|---|---:|---:|---|---|---|---:|---:|---:|---|---|");
+        patterns.stream().map(PatternStat::slowestQuery).filter(java.util.Objects::nonNull)
+                .forEach(query -> appendSlowQueryRow(report, query, remoteAliases));
     }
 
     private void appendRetainedSlowQueries(StringBuilder report, List<SlowQueryRecord> slowQueries,
@@ -311,13 +404,17 @@ public class MarkdownReportService {
         }
         line(report, "| 查询 ID | 时间 | 文件序号 | 行号 | 客户端 | Namespace | 操作 | 耗时 ms | CPU ns | 响应字节 | 执行计划 | 规范化查询模式 |");
         line(report, "|---|---|---:|---:|---|---|---|---:|---:|---:|---|---|");
-        slowQueries.forEach(query -> line(report, "| " + cell(query.queryId()) + " | "
+        slowQueries.forEach(query -> appendSlowQueryRow(report, query, remoteAliases));
+    }
+
+    private void appendSlowQueryRow(StringBuilder report, SlowQueryRecord query, RemoteAliases remoteAliases) {
+        line(report, "| " + cell(query.queryId()) + " | "
                 + time(query.timestampEpochMillis()) + " | " + query.fileIndex() + " | " + query.lineNumber()
                 + " | " + cell(remoteAliases.alias(query.remote())) + " | " + cell(query.namespace()) + " | "
                 + cell(query.operation()) + " | " + query.durationMillis() + " | "
                 + (query.cpuNanos() == null ? "-" : query.cpuNanos()) + " | "
                 + (query.responseLength() == null ? "-" : query.responseLength()) + " | "
-                + cell(query.planSummary()) + " | " + cell(query.queryPattern()) + " |"));
+                + cell(query.planSummary()) + " | " + cell(query.queryPattern()) + " |");
     }
 
     private void appendDiagnostics(StringBuilder report, LogDiagnostics diagnostics) {
@@ -333,12 +430,25 @@ public class MarkdownReportService {
         item(report, "诊断 Schema 版本", Integer.toString(diagnostics.schemaVersion()));
         item(report, "诊断已解析行数", Long.toString(diagnostics.totalParsedLines()));
         item(report, "时间桶宽度", diagnostics.timelineBucketMillis() + " ms");
+        item(report, "异常日志 W／E／F", Long.toString(abnormalCount(diagnostics)));
+        item(report, "连接建立／结束", diagnostics.connections().accepted() + "／" + diagnostics.connections().ended());
+        item(report, "复制集事件", diagnostics.replicationEvents().stream()
+                .mapToLong(LogDiagnostics.ReplicationEventStat::count).sum()
+                + " 次，" + diagnostics.replicationEvents().size() + " 种");
+        item(report, "慢查询线索", diagnostics.slowQueries().insights().size()
+                + " 条，从 " + diagnostics.slowQueries().total() + " 条慢查询筛选");
         appendQuality(report, diagnostics);
         appendEvents(report, diagnostics);
         appendDiagnosticTimeline(report, diagnostics);
         appendConnections(report, diagnostics);
         appendReplication(report, diagnostics);
         appendDiagnosticSlowQueries(report, diagnostics);
+    }
+
+    private long abnormalCount(LogDiagnostics diagnostics) {
+        return diagnostics.severityCounts().getOrDefault("W", 0L)
+                + diagnostics.severityCounts().getOrDefault("E", 0L)
+                + diagnostics.severityCounts().getOrDefault("F", 0L);
     }
 
     private void appendDiagnosticTimeline(StringBuilder report, LogDiagnostics diagnostics) {
@@ -412,20 +522,26 @@ public class MarkdownReportService {
     }
 
     private String joinCounts(Map<String, Long> counts) {
-        return counts.entrySet().stream().map(entry -> redact(entry.getKey()) + "=" + entry.getValue())
+        return counts.entrySet().stream().map(entry -> inline(entry.getKey()) + "=" + entry.getValue())
                 .reduce((left, right) -> left + "，" + right).orElse("无");
     }
 
     private String cell(Object value) {
         if (value == null) return "-";
-        return redact(String.valueOf(value)).replace("|", "\\|").replace("\r", " ").replace("\n", " ");
+        return inline(String.valueOf(value)).replace("|", "\\|");
+    }
+
+    private String inline(String value) {
+        return redact(value).replace("\r", " ").replace("\n", " ");
     }
 
     private String redact(String value) {
         if (value == null) return "";
         String redacted = MONGODB_URI.matcher(value).replaceAll("[MongoDB URI]");
+        redacted = IPV6.matcher(redacted).replaceAll("[IP]");
         redacted = IPV4.matcher(redacted).replaceAll("[IP]");
         redacted = EMAIL.matcher(redacted).replaceAll("[EMAIL]");
+        redacted = USER_IDENTITY.matcher(redacted).replaceAll("$1$2[REDACTED]");
         return SECRET.matcher(redacted).replaceAll("$1$2[REDACTED]");
     }
 
@@ -461,7 +577,7 @@ public class MarkdownReportService {
     }
 
     private String fileName(String taskName) {
-        String safe = taskName == null ? "mongodb-log" : taskName
+        String safe = taskName == null ? "mongodb-log" : inline(taskName)
                 .replaceAll("[\\\\/:*?\"<>|\\r\\n]", "_").trim();
         if (safe.isBlank()) safe = "mongodb-log";
         if (safe.length() > 80) safe = safe.substring(0, 80);

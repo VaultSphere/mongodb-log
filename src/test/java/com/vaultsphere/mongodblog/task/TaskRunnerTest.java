@@ -2,6 +2,7 @@ package com.vaultsphere.mongodblog.task;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
+import com.vaultsphere.mongodblog.analysis.diagnostics.LogDiagnostics;
 import com.vaultsphere.mongodblog.parser.CompositeLogParser;
 import com.vaultsphere.mongodblog.parser.LegacyLogParser;
 import com.vaultsphere.mongodblog.parser.QueryPatternNormalizer;
@@ -49,6 +50,7 @@ class TaskRunnerTest {
 
         AnalysisTask completed = repository.findTask(task.id()).orElseThrow();
         AnalysisSummary summary = repository.readSummary(task.id());
+        LogDiagnostics diagnostics = repository.readDiagnostics(task.id()).orElseThrow();
         assertThat(completed.status()).isEqualTo(TaskStatus.COMPLETED);
         assertThat(completed.processedLines()).isEqualTo(2);
         assertThat(completed.logStartEpochMillis()).isEqualTo(1717236930123L);
@@ -63,6 +65,10 @@ class TaskRunnerTest {
                 .containsExactly(742L, 325L);
         assertThat(summary.durationDistribution()).extracting(stat -> stat.count())
                 .containsExactly(0L, 1L, 1L, 0L, 0L, 0L, 0L, 0L);
+        assertThat(diagnostics.totalParsedLines()).isEqualTo(2);
+        assertThat(diagnostics.dataQuality().structuredLines()).isEqualTo(1);
+        assertThat(diagnostics.dataQuality().legacyLines()).isEqualTo(1);
+        assertThat(Files.readString(dataDir.resolve("tasks/task-ok/summary.json"))).doesNotContain("diagnostics");
         assertThat(work).doesNotExist();
     }
 

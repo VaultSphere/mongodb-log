@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { fetchSummary, fetchTask, fetchTasks } from './api/tasks.js'
+import { downloadReport, fetchDiagnostics, fetchSummary, fetchTask, fetchTasks } from './api/tasks.js'
 import UploadPanel from './components/UploadPanel.vue'
 import TaskList from './components/TaskList.vue'
 import StatisticsTables from './components/StatisticsTables.vue'
@@ -13,6 +13,7 @@ import SlowQueryDrawer from './components/SlowQueryDrawer.vue'
 import { formatBytes, formatTimeRange } from './utils/format.js'
 import FtdcWorkspace from './components/ftdc/FtdcWorkspace.vue'
 import MemoryOrb from './components/MemoryOrb.vue'
+import DiagnosticWorkspace from './components/DiagnosticWorkspace.vue'
 
 const workspaceModeStorageKey = 'mongodb-log:workspace-mode:v1'
 
@@ -30,6 +31,11 @@ const summary = ref(null)
 const detailSelection = ref(null)
 const summaryLoading = ref(false)
 const summaryError = ref('')
+const diagnostics = ref(null)
+const diagnosticsLoading = ref(false)
+const diagnosticsError = ref('')
+const reportLoading = ref(false)
+const resultView = ref('slow-queries')
 const progressError = ref('')
 const workspaceMode = ref(readWorkspaceMode())
 const workspaceRevision = ref(0)
@@ -37,6 +43,7 @@ let timer
 let pollingVersion = 0
 let listVersion = 0
 let summaryVersion = 0
+let diagnosticsVersion = 0
 
 const progress = computed(() => {
   const task = selectedTask.value
@@ -69,6 +76,10 @@ async function selectTask(task) {
   selectedTask.value = task
   summary.value = null
   summaryError.value = ''
+  diagnostics.value = null
+  diagnosticsError.value = ''
+  diagnosticsLoading.value = false
+  resultView.value = 'slow-queries'
   if (task.status === 'COMPLETED') {
     await loadSummary(task.id)
   } else if (task.status === 'QUEUED' || task.status === 'RUNNING') {
@@ -76,10 +87,45 @@ async function selectTask(task) {
   }
 }
 
+async function showDiagnostics() {
+  resultView.value = 'diagnostics'
+  detailSelection.value = null
+  const taskId = selectedTask.value?.id
+  if (!taskId || diagnostics.value || diagnosticsLoading.value) return
+  const request = ++diagnosticsVersion
+  diagnosticsLoading.value = true
+  diagnosticsError.value = ''
+  try {
+    const result = await fetchDiagnostics(taskId)
+    if (request === diagnosticsVersion && selectedTask.value?.id === taskId) diagnostics.value = result
+  } catch (error) {
+    if (request === diagnosticsVersion && selectedTask.value?.id === taskId) diagnosticsError.value = error.message
+  } finally {
+    if (request === diagnosticsVersion && selectedTask.value?.id === taskId) diagnosticsLoading.value = false
+  }
+}
+
+async function exportReport() {
+  if (!selectedTask.value || reportLoading.value) return
+  reportLoading.value = true
+  try {
+    await downloadReport(selectedTask.value.id)
+    ElMessage.success('Markdown 报告已导出')
+  } catch (error) {
+    ElMessage.error(error.message)
+  } finally {
+    reportLoading.value = false
+  }
+}
+
 async function loadSummary(taskId) {
   const request = ++summaryVersion
   summaryLoading.value = true
   summaryError.value = ''
+  diagnostics.value = null
+  diagnosticsLoading.value = false
+  diagnosticsError.value = ''
+  resultView.value = 'slow-queries'
   try {
     const result = await fetchSummary(taskId)
     if (request === summaryVersion && selectedTask.value?.id === taskId) summary.value = result
@@ -142,10 +188,15 @@ function selectWorkspaceMode(mode) {
 async function dataCleared() {
   stopPolling()
   ++summaryVersion
+  ++diagnosticsVersion
   ++listVersion
   tasks.value = []
   selectedTask.value = null
   summary.value = null
+  diagnostics.value = null
+  diagnosticsLoading.value = false
+  diagnosticsError.value = ''
+  resultView.value = 'slow-queries'
   detailSelection.value = null
   summaryLoading.value = false
   summaryError.value = ''
@@ -171,7 +222,7 @@ async function backToTasks() {
 }
 
 onMounted(loadTasks)
-onBeforeUnmount(() => { stopPolling(); ++listVersion; ++summaryVersion })
+onBeforeUnmount(() => { stopPolling(); ++listVersion; ++summaryVersion; ++diagnosticsVersion })
 </script>
 
 <template>
@@ -237,13 +288,27 @@ onBeforeUnmount(() => { stopPolling(); ++listVersion; ++summaryVersion })
               <p>统计仅包含成功提取的字段。失败行未计入分析，部分解析行可能缺少查询模式等字段；跳过行不属于可识别的 MongoDB 日志或为空行。</p>
               <ul v-if="Object.keys(summary.parseErrors || {}).length"><li v-for="(count, reason) in summary.parseErrors" :key="reason"><code>{{ reason }}</code>：{{ count }} 行</li></ul>
             </details>
-            <div class="layout-toolbar"><span>{{ summary.totalLines == null ? '分析结果' : summary.totalLines.toLocaleString() + ' 行日志' }} · {{ (summary.slowQueryCount || 0).toLocaleString() }} 条慢查询</span><button type="button" class="text-button" title="窗口大小已自动保存在此浏览器，可拖动右下角调整" @click="resetLayout">恢复默认布局</button></div>
-            <StatisticsTables :summary="summary" />
-            <DurationHistogram :buckets="summary.durationDistribution" />
-            <PatternTable :patterns="summary.patternStats" @select="sample => detailSelection = { sample }" />
-            <BreakdownCharts :summary="summary" />
-            <SlowQueryScatter :task-id="selectedTask.id" @select="queryId => detailSelection = { queryId }" />
-            <SlowQueryDrawer :task-id="selectedTask.id" :selection="detailSelection" @close="detailSelection = null" />
+            <div class="result-navigation">
+              <div class="result-tabs" role="tablist" aria-label="日志分析视图">
+                <button type="button" role="tab" :aria-selected="resultView === 'slow-queries'" :class="{ active: resultView === 'slow-queries' }" @click="resultView = 'slow-queries'">慢查询分析</button>
+                <button type="button" role="tab" :aria-selected="resultView === 'diagnostics'" :class="{ active: resultView === 'diagnostics' }" @click="showDiagnostics">运行诊断</button>
+              </div>
+              <button type="button" class="report-button" :disabled="reportLoading" @click="exportReport">{{ reportLoading ? '正在导出…' : '导出 AI 分析报告' }}</button>
+            </div>
+            <template v-if="resultView === 'slow-queries'">
+              <div class="layout-toolbar"><span>{{ summary.totalLines == null ? '分析结果' : summary.totalLines.toLocaleString() + ' 行日志' }} · {{ (summary.slowQueryCount || 0).toLocaleString() }} 条慢查询</span><button type="button" class="text-button" title="窗口大小已自动保存在此浏览器，可拖动右下角调整" @click="resetLayout">恢复默认布局</button></div>
+              <StatisticsTables :summary="summary" />
+              <DurationHistogram :buckets="summary.durationDistribution" />
+              <PatternTable :patterns="summary.patternStats" @select="sample => detailSelection = { sample }" />
+              <BreakdownCharts :summary="summary" />
+              <SlowQueryScatter :task-id="selectedTask.id" @select="queryId => detailSelection = { queryId }" />
+              <SlowQueryDrawer :task-id="selectedTask.id" :selection="detailSelection" @close="detailSelection = null" />
+            </template>
+            <template v-else>
+              <p v-if="diagnosticsLoading" role="status">正在加载运行诊断…</p>
+              <div v-else-if="diagnosticsError" class="request-error" role="alert"><span>{{ diagnosticsError }}</span><button type="button" class="text-button" @click="diagnostics = null; showDiagnostics()">重试诊断</button></div>
+              <DiagnosticWorkspace v-else-if="diagnostics" :diagnostics="diagnostics" />
+            </template>
           </section>
         </template>
         </template>
@@ -300,6 +365,12 @@ button, input { font: inherit; }
 .panel { min-width: 0; padding: 18px; border: 1px solid #dce3e8; border-radius: 5px; background: #fff; }
 .results { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .layout-toolbar { display: flex; justify-content: space-between; gap: 12px; color: #64748b; font-size: 12px; }
+.result-navigation { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 2px; border-bottom: 1px solid #dce3e8; }
+.result-tabs { display: flex; align-items: center; gap: 4px; }
+.result-tabs button { margin-bottom: -3px; padding: 9px 12px; border: 0; border-bottom: 2px solid transparent; color: #64748b; background: transparent; font-size: 12px; cursor: pointer; }
+.result-tabs button.active { color: #215c44; border-bottom-color: #347961; font-weight: 600; }
+.report-button { padding: 7px 12px; border: 1px solid #aac8bb; border-radius: 5px; color: #215c44; background: #eff6f2; font-size: 12px; cursor: pointer; }
+.report-button:hover { background: #e2f0e9; }.report-button:disabled { cursor: wait; opacity: .65; }
 .request-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; color: #9c472c; background: #fff7ed; }
 .parse-notice { padding: 12px 16px; border: 1px solid #e8d9bd; border-radius: 4px; background: #fffbf2; color: #785a28; font-size: 12px; line-height: 1.8; }
 .parse-notice summary { cursor: pointer; font-weight: 500; }

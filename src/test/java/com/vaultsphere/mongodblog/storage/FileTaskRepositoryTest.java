@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
 import com.vaultsphere.mongodblog.analysis.AnalysisAccumulator;
 import com.vaultsphere.mongodblog.analysis.SlowQueryRecord;
+import com.vaultsphere.mongodblog.analysis.diagnostics.DiagnosticAccumulator;
+import com.vaultsphere.mongodblog.analysis.diagnostics.LogDiagnostics;
 import com.vaultsphere.mongodblog.parser.ParseOutcome;
 import com.vaultsphere.mongodblog.parser.ParsedLogEntry;
 import com.vaultsphere.mongodblog.task.AnalysisTask;
@@ -34,15 +36,18 @@ class FileTaskRepositoryTest {
                 record("0-2", 500),
                 record("0-1", 300)
         );
+        LogDiagnostics diagnostics = new DiagnosticAccumulator().finish();
 
         repository.saveTask(task);
         repository.saveResult(task.id(), summary, records);
+        repository.saveDiagnostics(task.id(), diagnostics);
 
         assertThat(repository.findTask(task.id())).contains(task);
         assertThat(repository.listTasks()).containsExactly(task);
         assertThat(repository.readSummary(task.id())).isEqualTo(summary);
         assertThat(repository.readSlowQueries(task.id())).containsExactlyElementsOf(records);
         assertThat(repository.readSlowQuery(task.id(), "0-1")).contains(records.get(1));
+        assertThat(repository.readDiagnostics(task.id())).contains(diagnostics);
         try (var paths = Files.walk(tempDir)) {
             assertThat(paths.noneMatch(path -> path.getFileName().toString().endsWith(".tmp"))).isTrue();
         }
@@ -94,6 +99,7 @@ class FileTaskRepositoryTest {
         assertThat(summary.namespaceResponseBytes()).isNull();
         assertThat(summary.cpuByOperationBuckets()).isNull();
         assertThat(summary.averageConnections()).isNull();
+        assertThat(repository.readDiagnostics("historical")).isEmpty();
     }
 
     @Test

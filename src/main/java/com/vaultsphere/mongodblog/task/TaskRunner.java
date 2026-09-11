@@ -2,8 +2,13 @@ package com.vaultsphere.mongodblog.task;
 
 import com.vaultsphere.mongodblog.analysis.AnalysisAccumulator;
 import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
+import com.vaultsphere.mongodblog.analysis.diagnostics.DiagnosticAccumulator;
+import com.vaultsphere.mongodblog.analysis.diagnostics.LogDiagnostics;
 import com.vaultsphere.mongodblog.parser.LogParser;
+import com.vaultsphere.mongodblog.parser.ParseOutcome;
 import com.vaultsphere.mongodblog.storage.TaskRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -25,6 +30,7 @@ import java.util.zip.ZipException;
 @Component
 public class TaskRunner {
     private static final int TOP_QUERY_LIMIT = 5_000;
+    private static final Logger LOGGER = LoggerFactory.getLogger(TaskRunner.class);
 
     private final Path dataDirectory;
     private final TaskRepository repository;
@@ -51,6 +57,7 @@ public class TaskRunner {
         AnalysisTask running = task.running(System.currentTimeMillis());
         repository.saveTask(running);
         AnalysisAccumulator accumulator = new AnalysisAccumulator(TOP_QUERY_LIMIT);
+        DiagnosticAccumulator diagnosticsAccumulator = new DiagnosticAccumulator();
         long processedBytes = 0;
         long processedLines = 0;
         Path workDirectory = dataDirectory.resolve("work").resolve(taskId);
@@ -63,7 +70,8 @@ public class TaskRunner {
                 if (!path.startsWith(workDirectory)) {
                     throw new IOException("工作文件路径越界");
                 }
-                FileProgress progress = processFile(path, file.originalName(), fileIndex, accumulator, processedBytes, processedLines, running);
+                FileProgress progress = processFile(path, file.originalName(), fileIndex, accumulator,
+                        diagnosticsAccumulator, processedBytes, processedLines, running);
                 processedBytes = progress.processedBytes();
                 processedLines = progress.processedLines();
                 running = running.progress(processedBytes, processedLines);
@@ -71,6 +79,12 @@ public class TaskRunner {
             }
             AnalysisSummary summary = accumulator.finish();
             repository.saveResult(taskId, summary, accumulator.topSlowQueries());
+            LogDiagnostics diagnostics = diagnosticsAccumulator.finish();
+            try {
+                repository.saveDiagnostics(taskId, diagnostics);
+            } catch (RuntimeException diagnosticsFailure) {
+                LOGGER.warn("任务 {} 的运行诊断保存失败，慢查询分析结果仍然可用", taskId, diagnosticsFailure);
+            }
             terminal = running.completed(System.currentTimeMillis(), running.totalBytes(), processedLines,
                     summary.logStartEpochMillis(), summary.logEndEpochMillis());
         } catch (ZipException e) {
@@ -95,6 +109,7 @@ public class TaskRunner {
             String originalName,
             int fileIndex,
             AnalysisAccumulator accumulator,
+            DiagnosticAccumulator diagnosticsAccumulator,
             long bytesBefore,
             long linesBefore,
             AnalysisTask running
@@ -106,7 +121,9 @@ public class TaskRunner {
             String line;
             while ((line = reader.readLine()) != null) {
                 lineNumber++;
-                accumulator.accept(parser.parse(line, lineNumber, fileIndex));
+                ParseOutcome outcome = parser.parse(line, lineNumber, fileIndex);
+                accumulator.accept(outcome);
+                diagnosticsAccumulator.accept(outcome);
                 if (lineNumber % 1_000 == 0) {
                     repository.saveTask(running.progress(bytesBefore + counting.count(), linesBefore + lineNumber));
                 }

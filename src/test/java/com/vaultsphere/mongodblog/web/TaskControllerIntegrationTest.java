@@ -20,6 +20,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @SpringBootTest
@@ -62,6 +64,23 @@ class TaskControllerIntegrationTest {
                 .andExpect(jsonPath("$.slowQueryCount").value(1))
                 .andExpect(jsonPath("$.durationDistribution[2].key").value("500ms_1s"))
                 .andExpect(jsonPath("$.durationDistribution[2].count").value(1));
+
+        mockMvc.perform(get("/api/tasks/{id}/diagnostics", taskId))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.schemaVersion").value(1))
+                .andExpect(jsonPath("$.totalParsedLines").value(1))
+                .andExpect(jsonPath("$.dataQuality.structuredLines").value(1))
+                .andExpect(jsonPath("$.slowQueries.total").value(1));
+
+        MvcResult report = mockMvc.perform(get("/api/tasks/{id}/report.md", taskId))
+                .andExpect(status().isOk())
+                .andExpect(content().contentTypeCompatibleWith("text/markdown"))
+                .andExpect(header().string("Content-Disposition", org.hamcrest.Matchers.containsString("attachment")))
+                .andReturn();
+        String markdown = report.getResponse().getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
+        assertThat(markdown)
+                .contains("# MongoDB 日志分析报告", "## 数据可信度", "## 慢查询分析", "{\"amount\"")
+                .doesNotContain("10.0.0.8", "OPEN", "41712");
 
         mockMvc.perform(get("/api/tasks/{id}/slow-queries", taskId).param("page", "1").param("size", "20"))
                 .andExpect(status().isOk())

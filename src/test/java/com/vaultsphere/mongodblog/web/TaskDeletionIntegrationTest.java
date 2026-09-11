@@ -7,6 +7,7 @@ import com.vaultsphere.mongodblog.parser.CompositeLogParser;
 import com.vaultsphere.mongodblog.parser.LegacyLogParser;
 import com.vaultsphere.mongodblog.parser.QueryPatternNormalizer;
 import com.vaultsphere.mongodblog.parser.StructuredLogParser;
+import com.vaultsphere.mongodblog.report.MarkdownReportService;
 import com.vaultsphere.mongodblog.storage.FileTaskRepository;
 import com.vaultsphere.mongodblog.task.AnalysisTask;
 import com.vaultsphere.mongodblog.task.TaskRunner;
@@ -46,7 +47,8 @@ class TaskDeletionIntegrationTest {
         CompositeLogParser parser = new CompositeLogParser(new StructuredLogParser(normalizer), new LegacyLogParser(normalizer));
         TaskRunner runner = new TaskRunner(dataDir, repository, parser);
         TaskService service = new TaskService(dataDir.toString(), repository, runner, Runnable::run);
-        mockMvc = MockMvcBuilders.standaloneSetup(new TaskController(service, repository, parser))
+        mockMvc = MockMvcBuilders.standaloneSetup(new TaskController(service, repository, parser,
+                        new MarkdownReportService(repository)))
                 .setControllerAdvice(new GlobalExceptionHandler()).build();
     }
 

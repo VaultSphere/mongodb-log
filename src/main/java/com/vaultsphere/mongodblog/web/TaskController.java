@@ -4,6 +4,8 @@ import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
 import com.vaultsphere.mongodblog.analysis.SlowQueryRecord;
 import com.vaultsphere.mongodblog.parser.LogParser;
 import com.vaultsphere.mongodblog.parser.ParsedLogEntry;
+import com.vaultsphere.mongodblog.analysis.diagnostics.LogDiagnostics;
+import com.vaultsphere.mongodblog.report.MarkdownReportService;
 import com.vaultsphere.mongodblog.storage.TaskRepository;
 import com.vaultsphere.mongodblog.task.AnalysisTask;
 import com.vaultsphere.mongodblog.task.TaskService;
@@ -11,6 +13,8 @@ import com.vaultsphere.mongodblog.task.TaskStatus;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -25,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.nio.charset.StandardCharsets;
 
 @RestController
 @RequestMapping("/api/tasks")
@@ -32,11 +37,14 @@ public class TaskController {
     private final TaskService taskService;
     private final TaskRepository repository;
     private final LogParser parser;
+    private final MarkdownReportService reports;
 
-    public TaskController(TaskService taskService, TaskRepository repository, LogParser parser) {
+    public TaskController(TaskService taskService, TaskRepository repository, LogParser parser,
+                          MarkdownReportService reports) {
         this.taskService = taskService;
         this.repository = repository;
         this.parser = parser;
+        this.reports = reports;
     }
 
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -67,6 +75,26 @@ public class TaskController {
     public AnalysisSummary summary(@PathVariable String taskId) {
         requireCompleted(taskId);
         return repository.readSummary(taskId);
+    }
+
+    @GetMapping("/{taskId}/diagnostics")
+    public LogDiagnostics diagnostics(@PathVariable String taskId) {
+        requireCompleted(taskId);
+        return repository.readDiagnostics(taskId)
+                .orElseThrow(() -> new NoSuchElementException("此历史任务未生成运行诊断，请重新上传日志"));
+    }
+
+    @GetMapping(value = "/{taskId}/report.md", produces = "text/markdown;charset=UTF-8")
+    public ResponseEntity<String> report(@PathVariable String taskId) {
+        requireCompleted(taskId);
+        MarkdownReportService.Report report = reports.generate(taskId);
+        ContentDisposition disposition = ContentDisposition.attachment()
+                .filename(report.fileName(), StandardCharsets.UTF_8)
+                .build();
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, disposition.toString())
+                .contentType(MediaType.parseMediaType("text/markdown;charset=UTF-8"))
+                .body(report.content());
     }
 
     @GetMapping("/{taskId}/slow-queries")

@@ -1,5 +1,6 @@
 package com.vaultsphere.mongodblog.parser;
 
+import com.vaultsphere.mongodblog.analysis.diagnostics.LogEnvelopeMetadata;
 import org.bson.Document;
 
 import java.math.BigDecimal;
@@ -72,7 +73,8 @@ public final class StructuredLogParser implements LogParser {
                     line,
                     attr == null ? Map.of() : attr,
                     slowQuery,
-                    message != null && message.contains("Heartbeat failed")
+                    message != null && message.contains("Heartbeat failed"),
+                    envelopeMetadata(root)
             );
             if (slowQuery && duration == null) {
                 boolean missing = attr == null || attr.get("durationMillis") == null;
@@ -91,7 +93,7 @@ public final class StructuredLogParser implements LogParser {
                     numberValue(attr, "cpuNanos"), numberValue(attr, "reslen"),
                     attr == null ? null : stringValue(attr.get("planSummary")), remote(attr), "{}", line,
                     attr == null ? Map.of() : attr, slowQuery,
-                    message != null && message.contains("Heartbeat failed")
+                    message != null && message.contains("Heartbeat failed"), envelopeMetadata(root)
             );
             return ParseOutcome.partial(entry, "PATTERN_NORMALIZATION_FAILED", conciseMessage(e));
         }
@@ -114,6 +116,13 @@ public final class StructuredLogParser implements LogParser {
             case "createIndexes" -> command.get("indexes");
             default -> command.get("q");
         };
+    }
+
+    private LogEnvelopeMetadata envelopeMetadata(Document root) {
+        List<String> tags = root.get("tags") instanceof List<?> values
+                ? values.stream().map(String::valueOf).toList()
+                : List.of();
+        return new LogEnvelopeMetadata(stringValue(root.get("svc")), tags, root.get("truncated") != null);
     }
 
     private String operation(Document command, Document attr) {

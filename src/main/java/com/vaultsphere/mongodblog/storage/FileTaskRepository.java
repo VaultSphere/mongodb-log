@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vaultsphere.mongodblog.analysis.AnalysisSummary;
 import com.vaultsphere.mongodblog.analysis.SlowQueryRecord;
+import com.vaultsphere.mongodblog.analysis.diagnostics.LogDiagnostics;
 import com.vaultsphere.mongodblog.task.AnalysisTask;
 import com.vaultsphere.mongodblog.task.TaskStatus;
 import com.vaultsphere.mongodblog.task.TaskActiveException;
@@ -157,6 +158,12 @@ public class FileTaskRepository implements TaskRepository {
     }
 
     @Override
+    public synchronized void saveDiagnostics(String taskId, LogDiagnostics diagnostics) {
+        requireTask(taskId);
+        writeJson(tasksDirectory.resolve(taskId).resolve("diagnostics.json"), diagnostics);
+    }
+
+    @Override
     public AnalysisSummary readSummary(String taskId) {
         requireTask(taskId);
         Path path = tasksDirectory.resolve(taskId).resolve("summary.json");
@@ -164,6 +171,20 @@ public class FileTaskRepository implements TaskRepository {
             return objectMapper.readValue(path.toFile(), AnalysisSummary.class);
         } catch (IOException e) {
             throw new IllegalStateException("无法读取任务汇总：" + taskId, e);
+        }
+    }
+
+    @Override
+    public Optional<LogDiagnostics> readDiagnostics(String taskId) {
+        requireTask(taskId);
+        Path path = tasksDirectory.resolve(taskId).resolve("diagnostics.json");
+        if (!Files.exists(path)) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(objectMapper.readValue(path.toFile(), LogDiagnostics.class));
+        } catch (IOException e) {
+            throw new IllegalStateException("无法读取任务运行诊断：" + taskId, e);
         }
     }
 

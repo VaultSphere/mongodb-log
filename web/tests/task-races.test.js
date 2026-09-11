@@ -43,7 +43,10 @@ describe('task request ownership', () => {
   it('does not resurrect a deleted task from a stale list response', async () => {
     let resolveList
     let calls = 0
-    vi.stubGlobal('fetch', vi.fn(() => ++calls === 1 ? Promise.resolve(reply(tasks)) : new Promise(resolve => { resolveList = resolve })))
+    vi.stubGlobal('fetch', vi.fn(url => {
+      if (url === '/api/system/memory') return Promise.resolve(reply({ usedBytes: 1, maxBytes: 10, usagePercent: 10 }))
+      return ++calls === 1 ? Promise.resolve(reply(tasks)) : new Promise(resolve => { resolveList = resolve })
+    }))
     await open(); await select('a'); await back()
     await wrapper.get('[aria-label="delete-a"]').trigger('click')
     resolveList(reply(tasks)); await flushPromises()

@@ -11,6 +11,18 @@ import PatternTable from './components/PatternTable.vue'
 import SlowQueryScatter from './components/SlowQueryScatter.vue'
 import SlowQueryDrawer from './components/SlowQueryDrawer.vue'
 import { formatBytes, formatTimeRange } from './utils/format.js'
+import FtdcWorkspace from './components/ftdc/FtdcWorkspace.vue'
+import MemoryOrb from './components/MemoryOrb.vue'
+
+const workspaceModeStorageKey = 'mongodb-log:workspace-mode:v1'
+
+function readWorkspaceMode() {
+  try {
+    return localStorage.getItem(workspaceModeStorageKey) === 'ftdc' ? 'ftdc' : 'logs'
+  } catch {
+    return 'logs'
+  }
+}
 
 const tasks = ref([])
 const selectedTask = ref(null)
@@ -19,6 +31,8 @@ const detailSelection = ref(null)
 const summaryLoading = ref(false)
 const summaryError = ref('')
 const progressError = ref('')
+const workspaceMode = ref(readWorkspaceMode())
+const workspaceRevision = ref(0)
 let timer
 let pollingVersion = 0
 let listVersion = 0
@@ -120,6 +134,26 @@ function resetLayout() {
   } catch { ElMessage.error('浏览器未允许修改本地布局') }
 }
 
+function selectWorkspaceMode(mode) {
+  workspaceMode.value = mode
+  try { localStorage.setItem(workspaceModeStorageKey, mode) } catch { /* 使用当前会话选择 */ }
+}
+
+async function dataCleared() {
+  stopPolling()
+  ++summaryVersion
+  ++listVersion
+  tasks.value = []
+  selectedTask.value = null
+  summary.value = null
+  detailSelection.value = null
+  summaryLoading.value = false
+  summaryError.value = ''
+  progressError.value = ''
+  workspaceRevision.value++
+  await loadTasks()
+}
+
 async function taskCreated(task) {
   ++listVersion
   tasks.value.unshift(task)
@@ -144,13 +178,19 @@ onBeforeUnmount(() => { stopPolling(); ++listVersion; ++summaryVersion })
   <div class="app-shell">
     <header class="app-header">
       <div class="brand">
-        <strong>MongoDB Log</strong><span>日志分析</span>
+        <strong>{{ workspaceMode === 'logs' ? 'MongoDB Log' : 'MongoDB Metric' }}</strong><span>离线分析</span>
       </div>
-      <div class="offline-state">本地工作区</div>
+      <nav class="workspace-switch" aria-label="分析类型">
+        <button type="button" :class="{ active: workspaceMode === 'logs' }" @click="selectWorkspaceMode('logs')">MongoDB Log</button>
+        <button type="button" :class="{ active: workspaceMode === 'ftdc' }" @click="selectWorkspaceMode('ftdc')">MongoDB Metric</button>
+      </nav>
+      <div class="header-actions"><div class="offline-state">本地工作区</div><MemoryOrb @cleared="dataCleared" /></div>
     </header>
 
     <main class="page-container">
       <el-card class="workspace-card" shadow="never">
+        <FtdcWorkspace v-if="workspaceMode === 'ftdc'" :key="workspaceRevision" />
+        <template v-else>
         <template v-if="!selectedTask">
           <div class="page-title">
             <div>
@@ -206,6 +246,7 @@ onBeforeUnmount(() => { stopPolling(); ++listVersion; ++summaryVersion })
             <SlowQueryDrawer :task-id="selectedTask.id" :selection="detailSelection" @close="detailSelection = null" />
           </section>
         </template>
+        </template>
       </el-card>
     </main>
   </div>
@@ -235,6 +276,10 @@ button, input { font: inherit; }
 .brand strong { font-size: 15px; font-weight: 650; }
 .brand span { padding-left: 12px; border-left: 1px solid #dce3e8; color: #64748b; font-size: 12px; }
 .offline-state { color: #64748b; font-size: 12px; }
+.header-actions { display: flex; align-items: center; gap: 12px; }
+.workspace-switch { display: flex; align-items: center; gap: 4px; padding: 3px; border: 1px solid #dce3e8; border-radius: 6px; background: #f7f9fa; }
+.workspace-switch button { padding: 5px 12px; border: 0; border-radius: 4px; color: #64748b; background: transparent; font-size: 12px; cursor: pointer; }
+.workspace-switch button.active { color: #215c44; background: #fff; box-shadow: 0 1px 3px #dbe3e0; }
 .page-container { max-width: 1600px; margin: 0 auto; padding: 24px 28px 40px; }
 .workspace-card { min-width: 0; border: 0; border-radius: 0; background: transparent; overflow: visible; }
 .workspace-card > .el-card__body { padding: 0; }
@@ -293,6 +338,9 @@ button, input { font: inherit; }
   .page-container { padding: 18px 12px 30px; }
   .panel { padding: 16px; }
   .task-overview { padding: 16px; gap: 14px; }
-  .offline-state { padding: 5px 8px; font-size: 10px; }
+  .app-header { gap: 8px; padding: 0 10px; }
+  .brand span, .offline-state { display: none; }
+  .workspace-switch button { padding: 5px 7px; }
+  .header-actions { gap: 0; }
 }
 </style>

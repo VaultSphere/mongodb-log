@@ -2,6 +2,7 @@ package com.vaultsphere.mongodblog.web;
 
 import com.vaultsphere.mongodblog.task.TaskActiveException;
 import com.vaultsphere.mongodblog.task.TaskDeletionException;
+import com.vaultsphere.mongodblog.parser.ftdc.FtdcFormatException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MissingServletRequestParameterException;
@@ -47,6 +48,12 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiError> uploadTooLarge(MaxUploadSizeExceededException error) {
         return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE)
                 .body(new ApiError("UPLOAD_TOO_LARGE", "上传文件超过 12GB 限制"));
+    }
+
+    @ExceptionHandler(FtdcFormatException.class)
+    public ResponseEntity<ApiError> invalidFtdc(FtdcFormatException error) {
+        return ResponseEntity.unprocessableEntity()
+                .body(new ApiError("FTDC_FORMAT_ERROR", message(error)));
     }
 
     private String message(Exception error) {

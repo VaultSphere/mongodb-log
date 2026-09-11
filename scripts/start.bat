@@ -14,7 +14,7 @@ if %JAVA_VERSION% LSS 17 goto :bad_version
 if not exist "%JAR_FILE%" goto :no_jar
 
 cd /d "%APP_DIR%"
-java -Xms128m -Xmx512m -jar "%JAR_FILE%"
+java -Xms128m -Xmx2g -jar "%JAR_FILE%"
 if errorlevel 1 goto :runtime_error
 exit /b 0
 

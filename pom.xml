@@ -14,8 +14,8 @@
     <groupId>com.vaultsphere</groupId>
     <artifactId>mongodb-log-analyzer</artifactId>
     <version>0.1.0-SNAPSHOT</version>
-    <name>MongoDB Log Analyzer</name>
-    <description>Offline MongoDB log analyzer for operations teams</description>
+    <name>MongoDB Log &amp; Metric Analyzer</name>
+    <description>Offline MongoDB log and FTDC metric analyzer for operations teams</description>
 
     <properties>
         <java.version>17</java.version>

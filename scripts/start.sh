@@ -22,4 +22,4 @@ esac
 [ -f "$JAR_FILE" ] || fail "未找到 mongodb-log-analyzer.jar，请使用发布包或先执行 mvn package。"
 
 cd "$APP_DIR" || fail "无法进入程序目录。"
-exec java -Xms128m -Xmx512m -jar "$JAR_FILE"
+exec java -Xms128m -Xmx2g -jar "$JAR_FILE"

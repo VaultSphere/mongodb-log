@@ -2,6 +2,8 @@
 
 供运维人员在个人电脑上离线使用的 MongoDB 日志与 FTDC 指标分析工具。双击启动后，可在页面顶部切换 MongoDB Log 和 MongoDB Metric 工作区。
 
+面向使用者的完整操作步骤、数据保留方式和能力边界见 [使用方法与限制](docs/user-guide.md)；运行后也可点击页面右上角的「使用说明」。
+
 ## 核心能力
 
 - 支持 MongoDB 4.2 及之后的结构化 Extended JSON 日志。

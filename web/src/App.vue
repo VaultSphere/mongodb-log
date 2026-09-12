@@ -14,6 +14,7 @@ import { formatBytes, formatTimeRange } from './utils/format.js'
 import FtdcWorkspace from './components/ftdc/FtdcWorkspace.vue'
 import MemoryOrb from './components/MemoryOrb.vue'
 import DiagnosticWorkspace from './components/DiagnosticWorkspace.vue'
+import UsageGuideDialog from './components/UsageGuideDialog.vue'
 
 const workspaceModeStorageKey = 'mongodb-log:workspace-mode:v1'
 
@@ -235,7 +236,7 @@ onBeforeUnmount(() => { stopPolling(); ++listVersion; ++summaryVersion; ++diagno
         <button type="button" :class="{ active: workspaceMode === 'logs' }" @click="selectWorkspaceMode('logs')">MongoDB Log</button>
         <button type="button" :class="{ active: workspaceMode === 'ftdc' }" @click="selectWorkspaceMode('ftdc')">MongoDB Metric</button>
       </nav>
-      <div class="header-actions"><div class="offline-state">本地工作区</div><MemoryOrb @cleared="dataCleared" /></div>
+      <div class="header-actions"><UsageGuideDialog /><div class="offline-state">本地工作区</div><MemoryOrb @cleared="dataCleared" /></div>
     </header>
 
     <main class="page-container">
